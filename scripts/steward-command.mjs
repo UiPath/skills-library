@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Handles the steward commands typed as a pull request comment:
-//   /approve <sha>      merge the pull request (squash) at the commit the steward reviewed (full 40-character id)
+//   /approve            merge the pull request (squash) at its latest commit
+//   /approve <sha>      the same, but only if <sha> (full 40-character id) is the latest commit
 //   /reject <reason>    post the reason, label and close the pull request
 // Run by .github/workflows/steward-commands.yml from the default branch.
 
@@ -17,6 +18,10 @@ const APPROVAL_STATUS = "Steward approval";
 const CONTRIBUTION_ROOT = "skills/";
 // The full commit id: a short prefix can be matched by a second, crafted commit.
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
+// A plain /approve is refused when the latest commit arrived this recently before the comment:
+// the steward may have reviewed the commit before it. Naming the commit skips the wait.
+const SETTLE_MINUTES = 10;
+const MS_PER_MINUTE = 60_000;
 // GitHub lists at most this many files for a pull request; a longer listing is cut short.
 const MAX_LISTED_FILES = 3000;
 const MERGE_ATTEMPTS = 4;
@@ -47,7 +52,9 @@ export function filesOutsideContributions(paths) {
 // Decides what to do. Pure, so it can be tested without GitHub.
 // pr: { state, draft, authorId, headSha, changedFiles }; changedPaths, listedFiles and checkPassed are only
 // read for /approve. listedFiles is how many files the listing returned; changedFiles is GitHub's own count.
-export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], listedFiles = 0, checkPassed = false }) {
+// checkStartedAt is when GitHub started the check on the latest commit (set by GitHub, so it marks when the
+// commit arrived); commentedAt is when the steward commented. Both are epoch milliseconds.
+export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], listedFiles = 0, checkPassed = false, checkStartedAt = null, commentedAt = null }) {
   if (!parsed) return { action: "ignore", why: "no steward command" };
   if (!isSteward(commenterId, stewards)) return { action: "ignore", why: "the commenter is not a steward" };
   if (pr.state !== "open") return { action: "comment", message: "This pull request is not open, so there is nothing to approve or decline." };
@@ -65,10 +72,11 @@ export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], l
   }
   if (pr.draft) return { action: "comment", message: "This pull request is still a draft. Mark it ready for review first." };
   const sha = parsed.argument.toLowerCase();
-  if (!SHA_PATTERN.test(sha)) {
-    return { action: "comment", message: `Name the commit you reviewed, using its full 40-character id. The latest commit is \`${latest}\`: review it, then comment \`/approve ${latest}\`.` };
+  const namedCommit = sha !== "";
+  if (namedCommit && !SHA_PATTERN.test(sha)) {
+    return { action: "comment", message: `Use \`/approve\` on its own, or name the commit with its full 40-character id. The latest commit is \`${latest}\`.` };
   }
-  if (sha !== pr.headSha) {
+  if (namedCommit && sha !== pr.headSha) {
     return { action: "comment", message: `\`${sha}\` is not the latest commit, so new changes arrived after your review. The latest commit is \`${latest}\`: review it, then comment \`/approve ${latest}\`.` };
   }
   if (pr.changedFiles >= MAX_LISTED_FILES || listedFiles !== pr.changedFiles) {
@@ -81,6 +89,13 @@ export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], l
   }
   if (!checkPassed) {
     return { action: "comment", message: `Cannot approve yet: the \`${REQUIRED_CHECK}\` check has not passed on the latest commit.` };
+  }
+  if (!namedCommit) {
+    const settled = Number.isFinite(checkStartedAt) && Number.isFinite(commentedAt) &&
+      commentedAt - checkStartedAt >= SETTLE_MINUTES * MS_PER_MINUTE;
+    if (!settled) {
+      return { action: "comment", message: `The latest commit \`${latest}\` arrived less than ${SETTLE_MINUTES} minutes before your approval, so it may be newer than what you reviewed. Check **Files changed** again, then either comment \`/approve\` again in a few minutes or approve this exact commit now with \`/approve ${latest}\`.` };
+    }
   }
   return { action: "approve" };
 }
@@ -127,10 +142,13 @@ async function changedPathsOf(api, number) {
 
 // The check counts only when GitHub Actions reported it. With every changed file under skills/,
 // the workflow and validator that produced it are the ones on the default branch.
-async function requiredCheckPassed(api, sha) {
+// Returns whether it passed and when its latest run started.
+async function requiredCheck(api, sha) {
   const runs = await api("GET", `/commits/${sha}/check-runs?check_name=${encodeURIComponent(REQUIRED_CHECK)}&filter=latest`);
   const trusted = runs.check_runs.filter((run) => run.app?.slug === CHECK_APP);
-  return trusted.length > 0 && trusted.every((run) => run.conclusion === "success");
+  const passed = trusted.length > 0 && trusted.every((run) => run.conclusion === "success");
+  const startedAt = passed ? Math.max(...trusted.map((run) => Date.parse(run.started_at))) : null;
+  return { passed, startedAt };
 }
 
 async function addLabel(api, number, name) {
@@ -167,7 +185,7 @@ async function approveAndMerge(api, number, sha, approver) {
 }
 
 async function main() {
-  const { GITHUB_TOKEN, GITHUB_REPOSITORY, COMMENT_BODY, COMMENTER, COMMENTER_ID, PR_NUMBER } = process.env;
+  const { GITHUB_TOKEN, GITHUB_REPOSITORY, COMMENT_BODY, COMMENTER, COMMENTER_ID, COMMENTED_AT, PR_NUMBER } = process.env;
   const api = client(GITHUB_TOKEN, GITHUB_REPOSITORY);
   const comment = (message) => api("POST", `/issues/${PR_NUMBER}/comments`, { body: message });
 
@@ -179,9 +197,12 @@ async function main() {
 
   const approving = parsed?.command === "approve" && isSteward(commenterId, stewards) && pr.state === "open";
   const { paths: changedPaths, listedFiles } = approving ? await changedPathsOf(api, PR_NUMBER) : { paths: [], listedFiles: 0 };
-  const checkPassed = approving ? await requiredCheckPassed(api, pr.headSha) : false;
+  const check = approving ? await requiredCheck(api, pr.headSha) : { passed: false, startedAt: null };
 
-  const decision = decide({ parsed, commenterId, stewards, pr, changedPaths, listedFiles, checkPassed });
+  const decision = decide({
+    parsed, commenterId, stewards, pr, changedPaths, listedFiles,
+    checkPassed: check.passed, checkStartedAt: check.startedAt, commentedAt: Date.parse(COMMENTED_AT),
+  });
   console.log(`decision: ${decision.action}${decision.why ? ` (${decision.why})` : ""}`);
 
   if (decision.action === "comment") {
@@ -199,7 +220,7 @@ async function main() {
       throw error;
     }
     await addLabel(api, PR_NUMBER, "approved");
-    await comment(`Approved by @${COMMENTER} and merged. Thanks, @${pull.user.login}: this is now a UiPath-approved community skill.`);
+    await comment(`Approved by @${COMMENTER} and merged at commit \`${pr.headSha}\`. Thanks, @${pull.user.login}: this is now a UiPath-approved community skill.`);
   }
 }
 

@@ -9,8 +9,13 @@ const HEAD = "abc1234def5678900000000000000000000000ff";
 const stewards = [{ login: "steward-one", id: STEWARD }, { login: "steward-two", id: OTHER_STEWARD }];
 const openPr = { state: "open", draft: false, authorId: CONTRIBUTOR, headSha: HEAD, changedFiles: 2 };
 const skillPaths = ["skills/invoice-intake/SKILL.md", "skills/invoice-intake/recipe.json"];
+const COMMENTED_AT = Date.parse("2026-01-01T12:00:00Z");
+const minutesBefore = (minutes) => COMMENTED_AT - minutes * 60_000;
 const run = (body, overrides = {}) =>
-  decide({ parsed: parseCommand(body), commenterId: STEWARD, stewards, pr: openPr, changedPaths: skillPaths, listedFiles: skillPaths.length, checkPassed: true, ...overrides });
+  decide({
+    parsed: parseCommand(body), commenterId: STEWARD, stewards, pr: openPr, changedPaths: skillPaths,
+    listedFiles: skillPaths.length, checkPassed: true, checkStartedAt: minutesBefore(60), commentedAt: COMMENTED_AT, ...overrides,
+  });
 
 test("parseCommand reads the command and its argument", () => {
   assert.deepEqual(parseCommand("/approve abc1234"), { command: "approve", argument: "abc1234" });
@@ -43,10 +48,18 @@ test("approve merges an open, ready, green skills pull request from someone else
   assert.equal(run(`/approve ${HEAD}`, { pr: { ...openPr, authorId: STEWARD } }).action, "comment");
 });
 
-test("approve is bound to the commit the steward names", () => {
-  const missing = run("/approve");
-  assert.equal(missing.action, "comment");
-  assert.ok(missing.message.includes(`/approve ${HEAD}`));
+test("a plain approve uses the latest commit once it has settled", () => {
+  assert.equal(run("/approve").action, "approve");
+  assert.equal(run("/approve", { checkStartedAt: minutesBefore(10) }).action, "approve");
+  const fresh = run("/approve", { checkStartedAt: minutesBefore(3) });
+  assert.equal(fresh.action, "comment");
+  assert.ok(fresh.message.includes(`/approve ${HEAD}`));
+  assert.equal(run("/approve", { checkStartedAt: minutesBefore(-1) }).action, "comment"); // pushed after the comment
+  assert.equal(run("/approve", { checkStartedAt: null }).action, "comment"); // unknown arrival time fails closed
+});
+
+test("naming the commit approves it at once, and only if it is the latest", () => {
+  assert.equal(run(`/approve ${HEAD}`, { checkStartedAt: minutesBefore(1) }).action, "approve");
   assert.equal(run("/approve abc1234").action, "comment"); // a prefix could match a second, crafted commit
   const stale = run(`/approve ${"1".repeat(40)}`);
   assert.equal(stale.action, "comment");

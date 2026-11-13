@@ -8,7 +8,7 @@ Stewards are the people in [`.github/stewards.json`](../.github/stewards.json), 
 
 1. Open a pull request whose `Validate skills` check is green.
 2. Read the skill as the instructions an agent will follow.
-3. Comment `/approve <commit>` to merge it, or `/reject <reason>` to decline it.
+3. Comment `/approve` to merge it, or `/reject <reason>` to decline it.
 
 Contributors are promised a reply within 5 business days of their checks passing. A clear "no" within a week is better than silence.
 
@@ -43,25 +43,27 @@ You do not have to run the skill on a tenant to approve it. Running it end to en
 
 ## Approve
 
-1. Open the **Commits** tab and copy the full id of the latest commit with the copy button next to it.
-2. Review the **Files changed** tab at that commit.
-3. Comment on the pull request, with the command as the first word:
+1. Review the **Files changed** tab.
+2. Comment on the pull request, with the command as the first word:
 
    ```text
-   /approve <FULL_COMMIT_ID>
+   /approve
    ```
 
-   The id is 40 characters. A shortened id is refused, and the reply shows the full one.
+The bot takes the latest commit itself, squash-merges it, labels the pull request `approved`, and replies with the commit it merged.
 
-The pull request is squash-merged, labeled `approved`, and the contributor is thanked.
+**If the contributor pushed in the last 10 minutes,** a plain `/approve` is refused, because that commit may be newer than what you read. Look at **Files changed** again, then either comment `/approve` again a few minutes later, or approve that exact commit straight away with the full id the bot showed you:
 
-Naming the commit ties your approval to what you actually read. If the contributor pushes again after your review, the command is refused and you are shown the new commit.
+```text
+/approve <FULL_COMMIT_ID>
+```
 
 `/approve` is refused, with a comment explaining why, when:
 
 | Refusal | What to do |
 |---------|------------|
-| The commit is missing or is not the latest | Review the latest commit, then approve that one |
+| The latest commit arrived less than 10 minutes ago | Re-check the changes, then approve again or name the commit |
+| You named a commit that is not the latest | Review the latest commit, then approve that one |
 | The `Validate skills` check is not green | Wait for the contributor to fix it |
 | It is your own pull request | Ask another steward |
 | The pull request is a draft | Ask the contributor to mark it ready |
@@ -109,6 +111,6 @@ When removing, take the entry out of `.github/stewards.json` first.
 
 ## If a command does nothing
 
-- The command must be the first word of the comment. "Looks good, /approve <id>" is ignored.
+- The command must be the first word of the comment. "Looks good, /approve" is ignored.
 - Commands from people not in `.github/stewards.json` are ignored without a reply.
 - Otherwise open the [Steward commands runs](https://github.com/UiPath/skills-library/actions/workflows/steward-commands.yml) and read the failed step.
