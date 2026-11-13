@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Handles the steward commands typed as a pull request comment:
-//   /approve <sha>      merge the pull request (squash) at the commit the steward reviewed
+//   /approve <sha>      merge the pull request (squash) at the commit the steward reviewed (full 40-character id)
 //   /reject <reason>    post the reason, label and close the pull request
 // Run by .github/workflows/steward-commands.yml from the default branch.
 
@@ -15,8 +15,10 @@ const CHECK_APP = "github-actions";
 const APPROVAL_STATUS = "Steward approval";
 // /approve only merges contributions. Anything else (workflows, scripts, docs) is merged by a maintainer.
 const CONTRIBUTION_ROOT = "skills/";
-const SHA_PATTERN = /^[0-9a-f]{7,40}$/;
-const SHORT_SHA = 7;
+// The full commit id: a short prefix can be matched by a second, crafted commit.
+const SHA_PATTERN = /^[0-9a-f]{40}$/;
+// GitHub lists at most this many files for a pull request; a longer listing is cut short.
+const MAX_LISTED_FILES = 3000;
 const MERGE_ATTEMPTS = 4;
 const FILES_PER_PAGE = 100;
 const LABELS = {
@@ -43,8 +45,9 @@ export function filesOutsideContributions(paths) {
 }
 
 // Decides what to do. Pure, so it can be tested without GitHub.
-// pr: { state, draft, authorId, headSha }; changedPaths and checkPassed are only read for /approve.
-export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], checkPassed = false }) {
+// pr: { state, draft, authorId, headSha, changedFiles }; changedPaths, listedFiles and checkPassed are only
+// read for /approve. listedFiles is how many files the listing returned; changedFiles is GitHub's own count.
+export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], listedFiles = 0, checkPassed = false }) {
   if (!parsed) return { action: "ignore", why: "no steward command" };
   if (!isSteward(commenterId, stewards)) return { action: "ignore", why: "the commenter is not a steward" };
   if (pr.state !== "open") return { action: "comment", message: "This pull request is not open, so there is nothing to approve or decline." };
@@ -56,17 +59,20 @@ export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], c
     return { action: "reject" };
   }
 
-  const latest = pr.headSha.slice(0, SHORT_SHA);
+  const latest = pr.headSha;
   if (pr.authorId === commenterId) {
     return { action: "comment", message: "Stewards cannot `/approve` their own pull request. Ask another steward." };
   }
   if (pr.draft) return { action: "comment", message: "This pull request is still a draft. Mark it ready for review first." };
   const sha = parsed.argument.toLowerCase();
   if (!SHA_PATTERN.test(sha)) {
-    return { action: "comment", message: `Name the commit you reviewed. The latest commit is \`${latest}\`: review it, then comment \`/approve ${latest}\`.` };
+    return { action: "comment", message: `Name the commit you reviewed, using its full 40-character id. The latest commit is \`${latest}\`: review it, then comment \`/approve ${latest}\`.` };
   }
-  if (!pr.headSha.startsWith(sha)) {
+  if (sha !== pr.headSha) {
     return { action: "comment", message: `\`${sha}\` is not the latest commit, so new changes arrived after your review. The latest commit is \`${latest}\`: review it, then comment \`/approve ${latest}\`.` };
+  }
+  if (pr.changedFiles >= MAX_LISTED_FILES || listedFiles !== pr.changedFiles) {
+    return { action: "comment", message: "This pull request changes too many files to list completely, so `/approve` cannot confirm they are all under `skills/`. Ask the contributor to split it, or ask a maintainer to merge it." };
   }
   const outside = filesOutsideContributions(changedPaths);
   if (outside.length > 0) {
@@ -103,16 +109,19 @@ function client(token, repository) {
   };
 }
 
-// Every path the pull request touches, including the old path of a rename.
+// Every path the pull request touches, including the old path of a rename, plus how many
+// files the listing returned so the caller can tell a complete listing from a cut one.
 async function changedPathsOf(api, number) {
   const paths = [];
+  let listedFiles = 0;
   for (let page = 1; ; page += 1) {
     const files = await api("GET", `/pulls/${number}/files?per_page=${FILES_PER_PAGE}&page=${page}`);
+    listedFiles += files.length;
     for (const file of files) {
       paths.push(file.filename);
       if (file.previous_filename) paths.push(file.previous_filename);
     }
-    if (files.length < FILES_PER_PAGE) return paths;
+    if (files.length < FILES_PER_PAGE) return { paths, listedFiles };
   }
 }
 
@@ -166,13 +175,13 @@ async function main() {
   const commenterId = Number(COMMENTER_ID);
   const stewards = JSON.parse(readFileSync(join(ROOT, ".github", "stewards.json"), "utf8")).stewards;
   const pull = await api("GET", `/pulls/${PR_NUMBER}`);
-  const pr = { state: pull.state, draft: pull.draft, authorId: pull.user.id, headSha: pull.head.sha };
+  const pr = { state: pull.state, draft: pull.draft, authorId: pull.user.id, headSha: pull.head.sha, changedFiles: pull.changed_files };
 
   const approving = parsed?.command === "approve" && isSteward(commenterId, stewards) && pr.state === "open";
-  const changedPaths = approving ? await changedPathsOf(api, PR_NUMBER) : [];
+  const { paths: changedPaths, listedFiles } = approving ? await changedPathsOf(api, PR_NUMBER) : { paths: [], listedFiles: 0 };
   const checkPassed = approving ? await requiredCheckPassed(api, pr.headSha) : false;
 
-  const decision = decide({ parsed, commenterId, stewards, pr, changedPaths, checkPassed });
+  const decision = decide({ parsed, commenterId, stewards, pr, changedPaths, listedFiles, checkPassed });
   console.log(`decision: ${decision.action}${decision.why ? ` (${decision.why})` : ""}`);
 
   if (decision.action === "comment") {

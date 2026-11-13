@@ -75,6 +75,20 @@ test("symbolic links inside a skill folder are rejected", () => {
   assert.ok(errors[0].includes("references/hosts.md"));
 });
 
+test("a symbolic link or file directly under skills/ is reported, not skipped", () => {
+  const skillsDir = mkdtempSync(join(tmpdir(), "skills-library-"));
+  try {
+    symlinkSync(TEMPLATE, join(skillsDir, "linked-skill"));
+    writeFileSync(join(skillsDir, "notes.md"), "stray file");
+    writeFileSync(join(skillsDir, ".gitkeep"), "");
+    const results = validateAll(skillsDir);
+    assert.deepEqual(results.map((r) => r.folder), ["linked-skill", "notes.md"]);
+    for (const { errors } of results) assert.ok(errors[0].includes("only skill folders are allowed"));
+  } finally {
+    rmSync(skillsDir, { recursive: true, force: true });
+  }
+});
+
 test("a verified skill needs last_verified", () => {
   const errors = errorsFor("verified-one", ({ meta }) => { meta.tier = "verified"; });
   assert.ok(errors.some((e) => e.includes("needs last_verified")));

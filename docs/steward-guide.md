@@ -43,13 +43,15 @@ You do not have to run the skill on a tenant to approve it. Running it end to en
 
 ## Approve
 
-1. Open the **Commits** tab and note the latest commit, for example `abc1234`.
+1. Open the **Commits** tab and copy the full id of the latest commit with the copy button next to it.
 2. Review the **Files changed** tab at that commit.
 3. Comment on the pull request, with the command as the first word:
 
    ```text
-   /approve abc1234
+   /approve <FULL_COMMIT_ID>
    ```
+
+   The id is 40 characters. A shortened id is refused, and the reply shows the full one.
 
 The pull request is squash-merged, labeled `approved`, and the contributor is thanked.
 
@@ -64,6 +66,7 @@ Naming the commit ties your approval to what you actually read. If the contribut
 | It is your own pull request | Ask another steward |
 | The pull request is a draft | Ask the contributor to mark it ready |
 | It changes files outside `skills/` | See the next section |
+| It changes too many files to list (about 3,000) | Ask the contributor to split it |
 
 ## Pull requests that change more than skills
 
@@ -106,6 +109,6 @@ When removing, take the entry out of `.github/stewards.json` first.
 
 ## If a command does nothing
 
-- The command must be the first word of the comment. "Looks good, /approve abc1234" is ignored.
+- The command must be the first word of the comment. "Looks good, /approve <id>" is ignored.
 - Commands from people not in `.github/stewards.json` are ignored without a reply.
 - Otherwise open the [Steward commands runs](https://github.com/UiPath/skills-library/actions/workflows/steward-commands.yml) and read the failed step.
