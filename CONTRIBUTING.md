@@ -58,7 +58,7 @@ Stewards are the people listed in `.github/stewards.json`, who are also the `@Ui
 | `/approve` | The pull request is squash-merged and labeled `approved`. Needs the `Validate skills` check green on the latest commit. A steward cannot approve their own pull request. |
 | `/reject <reason>` | The reason is posted to the contributor, the pull request is labeled `declined` and closed. The reason is required. |
 
-Commands from anyone else are ignored. To add or remove a steward, change both the team and `.github/stewards.json`.
+Commands from anyone else are ignored. `/approve` sets the required `Steward approval` status on the approved commit, so a pull request cannot merge without it, and a new commit needs a new `/approve`. To add or remove a steward, change both the team and `.github/stewards.json`.
 
 ## Owning a skill
 

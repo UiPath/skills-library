@@ -10,6 +10,10 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REQUIRED_CHECK = "Validate skills";
+// Required status on main. Only this workflow sets it, so a pull request cannot merge without /approve.
+const APPROVAL_STATUS = "Steward approval";
+const MERGE_ATTEMPTS = 4;
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 const LABELS = {
   approved: { color: "1f8a5b", description: "Approved by a UiPath steward" },
   declined: { color: "b7791f", description: "Declined by a UiPath steward, with a reason" },
@@ -110,8 +114,22 @@ async function main() {
     await addLabel(api, PR_NUMBER, "declined");
     await api("PATCH", `/pulls/${PR_NUMBER}`, { state: "closed" });
   } else if (decision.action === "approve") {
+    await api("POST", `/statuses/${pull.head.sha}`, {
+      state: "success",
+      context: APPROVAL_STATUS,
+      description: `Approved by ${COMMENTER}`,
+    });
     // Passing the head sha makes the merge fail if a commit landed after the check ran.
-    await api("PUT", `/pulls/${PR_NUMBER}/merge`, { merge_method: "squash", sha: pull.head.sha });
+    // The branch rules can take a moment to see the new status, so retry a refused merge.
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await api("PUT", `/pulls/${PR_NUMBER}/merge`, { merge_method: "squash", sha: pull.head.sha });
+        break;
+      } catch (error) {
+        if (error.status !== 405 || attempt === MERGE_ATTEMPTS) throw error;
+        await sleep(5000);
+      }
+    }
     await addLabel(api, PR_NUMBER, "approved");
     await comment(`Approved by @${COMMENTER} and merged. Thanks, @${pr.author}: this is now a UiPath-approved community skill.`);
   }
