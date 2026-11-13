@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+package-lock.json
+.venv
+**/.env
+**/.uipath
+**/.claude/settings.local.json
+**/.claude/*.local.json
+.worktrees/
+.local/
+tmp/
