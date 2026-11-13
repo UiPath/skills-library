@@ -1,6 +1,6 @@
 name: Steward commands
 
-# /approve <sha> and /reject <reason>, typed by a steward as a comment on a pull request.
+# /approve and /reject <reason>, typed by a steward as a comment on a pull request.
 # issue_comment always runs the workflow and scripts from the default branch,
 # never from the pull request, so a contributor cannot change what runs here.
 on:
@@ -39,5 +39,6 @@ jobs:
           COMMENT_BODY: ${{ github.event.comment.body }}
           COMMENTER: ${{ github.event.comment.user.login }}
           COMMENTER_ID: ${{ github.event.comment.user.id }}
+          COMMENTED_AT: ${{ github.event.comment.created_at }}
           PR_NUMBER: ${{ github.event.issue.number }}
         run: node scripts/steward-command.mjs

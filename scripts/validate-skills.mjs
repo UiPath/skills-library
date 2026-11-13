@@ -13,6 +13,7 @@ const RESERVED_PREFIX = "uipath-";
 const DESCRIPTION_LIMIT = 1024;
 const DISCLAIMER = "UiPath-approved community skill. Maintained by its author.";
 const MIN_RECIPE_PRODUCTS = 2;
+const KEEP_FILE = ".gitkeep";
 
 const readJson = (path) => JSON.parse(readFileSync(path, "utf8"));
 
@@ -141,10 +142,15 @@ export function validateAll(skillsDir) {
     schema: readJson(join(ROOT, "schemas", "recipe.schema.json")),
     coreNames: readJson(join(ROOT, "assets", "core-skill-names.json")).names,
   };
-  const folders = existsSync(skillsDir)
-    ? readdirSync(skillsDir).filter((entry) => lstatSync(join(skillsDir, entry)).isDirectory()).sort()
-    : [];
-  return folders.map((folder) => ({ folder, errors: validateSkill(join(skillsDir, folder), folder, context) }));
+  const entries = existsSync(skillsDir) ? readdirSync(skillsDir).filter((entry) => entry !== KEEP_FILE).sort() : [];
+  // Anything that is not a real directory (a file, a symbolic link) is reported, never skipped.
+  return entries.map((folder) => {
+    const path = join(skillsDir, folder);
+    if (!lstatSync(path).isDirectory()) {
+      return { folder, errors: ["only skill folders are allowed directly under skills/ (no files or symbolic links)"] };
+    }
+    return { folder, errors: validateSkill(path, folder, context) };
+  });
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

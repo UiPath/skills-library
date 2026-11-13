@@ -51,7 +51,7 @@ Does not belong here: changes to a core skill (names starting with `uipath-`). O
 
 ## For stewards
 
-Stewards approve with `/approve <commit>` and decline with `/reject <reason>`, typed as a pull request comment. The full process is in the [steward guide](docs/steward-guide.md).
+Stewards approve with `/approve` and decline with `/reject <reason>`, typed as a pull request comment. The full process is in the [steward guide](docs/steward-guide.md).
 
 ## Owning a skill
 
