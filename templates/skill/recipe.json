@@ -1,0 +1,12 @@
+{
+  "$schema": "../../schemas/recipe.schema.json",
+  "name": "your-skill-name",
+  "kind": "recipe",
+  "authors": [
+    { "github": "your-github-login", "name": "Your Name", "organization": "Your Company" }
+  ],
+  "products": ["Maestro Flow", "Action Center"],
+  "industry": "Finance",
+  "tier": "community",
+  "cli_version": "1.207.0"
+}

@@ -1,7 +1,7 @@
 # UiPath Skills Library
 
 > [!IMPORTANT]
-> **Community skills. Not supported by UiPath.** Skills here are written by partners, MVPs and UiPath delivery teams. They are checked for format and safety, not tested by UiPath unless a skill is marked Verified. For the supported per-product skills, use [UiPath/skills](https://github.com/UiPath/skills).
+> **UiPath-approved community skills.** Every skill here is written by a partner, an MVP or a UiPath delivery team, and is reviewed and approved by a UiPath steward before it merges. Each skill is maintained by its author, and UiPath Support does not cover it. For the skills UiPath builds and supports itself, use [UiPath/skills](https://github.com/UiPath/skills).
 
 A library of contributed skills for AI coding agents (Claude Code, Cursor, Codex, Copilot, Gemini) that build UiPath automations. It holds two kinds:
 
@@ -29,8 +29,8 @@ Install the core skills first with `uip skills install`.
 
 | Tier | Who reviews | What it promises |
 |------|-------------|------------------|
-| Community | Bots, plus a steward skim for safety and format | Installs, follows the format, carries no secrets. Not tested by UiPath. |
-| Verified | A UiPath reviewer ran it end to end on a tenant | Worked on the stated CLI version and date. |
+| Approved | Automated checks, then a UiPath steward approves it for safety and format | Installs, follows the format, carries no secrets. UiPath has not run it end to end. |
+| Verified | Approved, and a UiPath reviewer ran it end to end on a tenant | Worked on the stated CLI version and date. |
 | Archived | Automatic, 30 days after an unanswered staleness issue | Kept for reading under `archived/`, out of the install path. |
 
 ## Catalog

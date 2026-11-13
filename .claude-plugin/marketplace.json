@@ -1,0 +1,21 @@
+{
+  "name": "uipath-library-marketplace",
+  "owner": {
+    "name": "UiPath"
+  },
+  "plugins": [
+    {
+      "name": "uipath-library",
+      "source": "./",
+      "description": "Community-contributed skills and multi-product recipes for UiPath coding agents, reviewed and approved by UiPath.",
+      "version": "0.1.0",
+      "author": {
+        "name": "UiPath community"
+      },
+      "homepage": "https://github.com/UiPath/skills-library",
+      "repository": "https://github.com/UiPath/skills-library",
+      "license": "MIT",
+      "keywords": ["uipath", "automation", "skills", "recipes", "community"]
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Problem with a core UiPath skill (uipath-*)
+    url: https://github.com/UiPath/skills/issues
+    about: Skills whose names start with uipath- live in the core repo. Report them there.
+  - name: Security vulnerability
+    url: https://github.com/UiPath/skills-library/security/advisories/new
+    about: Report privately. Do not open a public issue.
