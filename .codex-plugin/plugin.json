@@ -1,0 +1,30 @@
+{
+  "name": "uipath-library",
+  "version": "0.1.0",
+  "description": "UiPath-approved community skills and multi-product recipes for building UiPath automations from Codex.",
+  "author": {
+    "name": "UiPath community"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/UiPath/skills-library",
+  "repository": "https://github.com/UiPath/skills-library",
+  "keywords": ["uipath", "automation", "skills", "recipes", "community"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "UiPath Skills Library",
+    "shortDescription": "UiPath-approved community skills and recipes",
+    "longDescription": "Community-contributed skills and multi-product recipes for UiPath, reviewed and approved by a UiPath steward. They build on the core UiPath skills and document how products fit together in real scenarios.",
+    "developerName": "UiPath community",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"],
+    "websiteURL": "https://github.com/UiPath/skills-library",
+    "privacyPolicyURL": "https://www.uipath.com/legal/privacy-policy",
+    "termsOfServiceURL": "https://www.uipath.com/legal/terms-of-use",
+    "defaultPrompt": [
+      "Find a UiPath Skills Library recipe that fits this scenario and build it with the core UiPath skills."
+    ],
+    "brandColor": "#FA4616",
+    "composerIcon": "./.codex-plugin/assets/uipath-icon.png",
+    "logo": "./.codex-plugin/assets/uipath-icon.png"
+  }
+}

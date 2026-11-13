@@ -1,0 +1,25 @@
+name: Validate skills
+
+# No `paths:` filter on purpose: this is a required check, and a required check
+# that never reports blocks the merge forever.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate skills
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Validator tests
+        run: npm test
+      - name: Validate every skill folder
+        run: npm run validate

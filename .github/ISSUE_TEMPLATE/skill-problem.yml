@@ -1,0 +1,25 @@
+name: Problem with a library skill
+description: A skill in this repo is wrong, outdated or does not work.
+labels: ["skill-problem"]
+body:
+  - type: input
+    id: skill
+    attributes:
+      label: Skill name
+      placeholder: invoice-intake-ixp-maestro
+    validations:
+      required: true
+  - type: input
+    id: cli
+    attributes:
+      label: uip CLI version
+      description: Output of `uip --version`
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you asked the agent to do, what it did, and what you expected. Remove tenant names and customer data.
+    validations:
+      required: true

@@ -1,0 +1,32 @@
+{
+  "name": "uipath-library-marketplace",
+  "owner": {
+    "name": "UiPath"
+  },
+  "interface": {
+    "displayName": "UiPath Skills Library"
+  },
+  "plugins": [
+    {
+      "name": "uipath-library",
+      "source": {
+        "source": "local",
+        "path": "./"
+      },
+      "description": "UiPath-approved community skills and multi-product recipes for building UiPath automations from Codex.",
+      "version": "0.1.0",
+      "author": {
+        "name": "UiPath community"
+      },
+      "homepage": "https://github.com/UiPath/skills-library",
+      "repository": "https://github.com/UiPath/skills-library",
+      "license": "MIT",
+      "keywords": ["uipath", "automation", "skills", "recipes", "community"],
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

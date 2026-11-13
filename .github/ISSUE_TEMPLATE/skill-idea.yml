@@ -1,0 +1,26 @@
+name: Skill or recipe idea
+description: Propose a skill or recipe before writing it, or ask for one you need.
+labels: ["idea"]
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - Recipe (two or more UiPath products in one scenario)
+        - Skill (one capability the core repo does not cover)
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: Scenario
+      description: The business scenario or capability, and the UiPath products it touches.
+    validations:
+      required: true
+  - type: checkboxes
+    id: author
+    attributes:
+      label: Who writes it
+      options:
+        - label: I plan to contribute this myself
