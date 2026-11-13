@@ -49,6 +49,17 @@ Does not belong here: changes to a core skill (names starting with `uipath-`). O
 3. The steward approves, or declines with a reason. A merged skill is listed as UiPath approved.
 4. On merge you become the owner of your skill folder in `CODEOWNERS`.
 
+## For stewards
+
+Stewards are the people listed in `.github/stewards.json`, who are also the `@UiPath/skills-steward` team. Type one of these as a comment on a pull request, as the first word:
+
+| Comment | What happens |
+|---------|--------------|
+| `/approve` | The pull request is squash-merged and labeled `approved`. Needs the `Validate skills` check green on the latest commit. A steward cannot approve their own pull request. |
+| `/reject <reason>` | The reason is posted to the contributor, the pull request is labeled `declined` and closed. The reason is required. |
+
+Commands from anyone else are ignored. To add or remove a steward, change both the team and `.github/stewards.json`.
+
 ## Owning a skill
 
 You own what you contribute. When the `uip` CLI changes and your skill breaks, an issue is opened and assigned to you. A skill whose owner does not reply within 30 days moves to `archived/`: still readable, no longer installable. You can bring it back with a pull request.
