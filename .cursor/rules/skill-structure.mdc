@@ -1,0 +1,16 @@
+---
+description: Skill folder layout, naming, SKILL.md frontmatter and recipe.json metadata
+globs: ["skills/**/*", "templates/skill/**/*", "schemas/recipe.schema.json"]
+---
+
+Every skill lives in `skills/<name>/` with `SKILL.md` and `recipe.json`; `references/` and `assets/` are optional. Start from `templates/skill/`.
+
+Names are kebab-case, never start with `uipath-` (reserved for the core repo, UiPath/skills), and are identical in three places: folder, `SKILL.md` frontmatter `name`, `recipe.json` `name`.
+
+`SKILL.md` frontmatter needs `name` and `description`. Keep `description` under 1024 characters and lead with the scenario and products. The body must contain the line `UiPath-approved community skill. Maintained by its author.`
+
+`recipe.json` follows `schemas/recipe.schema.json`. `kind` is `recipe` (two or more products, plus `references/seams-guide.md`) or `skill`. `tier` is `community` unless a steward set `verified`.
+
+Skills are self-contained: name core skills, never copy their content, never link into another skill's folder. `SKILL.md` stays tool-agnostic. No secrets, tenant identifiers, customer names or real sample data; use `<PLACEHOLDER>` values.
+
+Run `npm run validate` after any change under `skills/`.

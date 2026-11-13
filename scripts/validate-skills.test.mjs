@@ -72,3 +72,20 @@ test("a verified skill needs last_verified", () => {
   const errors = errorsFor("verified-one", ({ meta }) => { meta.tier = "verified"; });
   assert.ok(errors.some((e) => e.includes("needs last_verified")));
 });
+
+test("every plugin manifest carries the package.json version and the plugin name", () => {
+  const read = (path) => JSON.parse(readFileSync(join(ROOT, path), "utf8"));
+  const version = read("package.json").version;
+  const manifests = [
+    read(".claude-plugin/plugin.json"),
+    read(".claude-plugin/marketplace.json").plugins[0],
+    read(".cursor-plugin/plugin.json"),
+    read(".codex-plugin/plugin.json"),
+    read(".agents/plugins/marketplace.json").plugins[0],
+    read("gemini-extension.json"),
+  ];
+  for (const manifest of manifests) {
+    assert.equal(manifest.version, version);
+    assert.equal(manifest.name, "uipath-library");
+  }
+});

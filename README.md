@@ -18,12 +18,38 @@ Internal preview. The repo is being scaffolded and seeded before it opens to out
 
 ## Install
 
+Install the core skills first with `uip skills install`. Then add library skills for your coding agent.
+
+**Any agent** (Claude Code, Cursor, Codex, GitHub Copilot, Gemini CLI, OpenCode, Windsurf and others), through the [`skills` CLI](https://www.skills.sh):
+
 ```bash
 npx skills add UiPath/skills-library --list            # browse
 npx skills add UiPath/skills-library --skill <name>    # install one skill
 ```
 
-Install the core skills first with `uip skills install`.
+**Claude Code**, as a plugin:
+
+```bash
+claude plugin marketplace add UiPath/skills-library
+claude plugin install uipath-library@uipath-library-marketplace
+```
+
+**OpenAI Codex CLI**, as a plugin (Codex CLI 0.142.0 or later):
+
+```bash
+codex plugin marketplace add UiPath/skills-library --ref main
+codex plugin add uipath-library@uipath-library-marketplace
+```
+
+| Agent | What the repo ships |
+|-------|---------------------|
+| Claude Code | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` |
+| Cursor | `.cursor-plugin/plugin.json`; contributor rules in `.cursor/rules/` |
+| OpenAI Codex CLI | `.codex-plugin/plugin.json`, `.agents/plugins/marketplace.json`, `.agents/skills/` |
+| Gemini CLI | `gemini-extension.json`, `.gemini/settings.json` |
+| GitHub Copilot coding agent | `AGENTS.md` |
+
+The repo uses git symlinks (`AGENTS.md`, `.agents/skills`). On Windows, clone with `git clone -c core.symlinks=true`.
 
 ## Tiers
 

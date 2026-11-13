@@ -9,6 +9,7 @@ This repo holds community-contributed skills for UiPath. Read [CONTRIBUTING.md](
 - `schemas/recipe.schema.json` — metadata contract. `scripts/validate-skills.mjs` enforces it.
 - `assets/core-skill-names.json` — names taken by the core repo, [UiPath/skills](https://github.com/UiPath/skills).
 - `archived/` — skills removed from the install path. Never install from here.
+- `.claude-plugin/`, `.cursor-plugin/`, `.codex-plugin/`, `.agents/plugins/`, `gemini-extension.json` — per-agent plugin manifests. All carry the same name (`uipath-library`) and the `package.json` version; change them together.
 
 ## Rules
 
