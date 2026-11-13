@@ -15,7 +15,9 @@ const CHECK_APP = "github-actions";
 const ACTIONS_BOT = "github-actions[bot]";
 const ARRIVAL_STATUS_PREFIX = "Head arrival (PR #";
 const STATUSES_PER_PAGE = 100;
-const FORCE_PUSH_EVENT = "head_ref_force_pushed";
+// Timeline events after which the head may be a commit that was the head before. An ordinary
+// push only ever adds a new commit, which has no arrival record until the recorder writes one.
+const HEAD_REWIND_EVENTS = new Set(["head_ref_force_pushed", "head_ref_deleted", "head_ref_restored", "reopened"]);
 const TIMELINE_PER_PAGE = 100;
 const MAX_TIMELINE_PAGES = 20;
 // Required status on main. Only this workflow sets it, so a pull request cannot merge without /approve.
@@ -167,18 +169,18 @@ export function headArrival(statuses, number) {
   return times.length > 0 ? Math.max(...times) : null;
 }
 
-// The arrival record is written a moment after the push. A force-push can put an earlier,
-// already recorded commit back as the head, and until the new record lands the old one would
-// make that commit look settled. GitHub timestamps every force-push itself, so the arrival is
-// the later of the record and the newest force-push. timeline is null when it could not be
+// The arrival record is written a moment after the push. A force-push, or deleting and restoring
+// the branch and reopening, can put an earlier, already recorded commit back as the head, and until
+// the new record lands the old one would make that commit look settled. GitHub timestamps those
+// events itself, so the arrival is the later of the record and the newest such event. timeline is null when it could not be
 // read in full; with no record or no complete timeline the answer is null, which /approve refuses.
 export function effectiveArrival(recordedAt, timeline) {
   if (recordedAt === null || timeline === null) return null;
-  const forcePushes = timeline
-    .filter((event) => event.event === FORCE_PUSH_EVENT)
+  const rewinds = timeline
+    .filter((event) => HEAD_REWIND_EVENTS.has(event.event))
     .map((event) => Date.parse(event.created_at))
     .filter(Number.isFinite);
-  return Math.max(recordedAt, ...forcePushes);
+  return Math.max(recordedAt, ...rewinds);
 }
 
 // Every timeline event of the pull request, or null when there are too many to read in full.

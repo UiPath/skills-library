@@ -80,6 +80,9 @@ test("a force-push after the record makes the commit count as newly arrived", ()
   assert.equal(effectiveArrival(recorded, timeline), Date.parse("2026-01-01T11:58:00Z"));
   assert.equal(effectiveArrival(recorded, [forcePush("2026-01-01T08:00:00Z")]), recorded);
   assert.equal(effectiveArrival(recorded, []), recorded);
+  for (const event of ["reopened", "head_ref_restored", "head_ref_deleted"]) {
+    assert.equal(effectiveArrival(recorded, [{ event, created_at: "2026-01-01T11:00:00Z" }]), Date.parse("2026-01-01T11:00:00Z"));
+  }
   assert.equal(effectiveArrival(null, timeline), null); // no record: fail closed
   assert.equal(effectiveArrival(recorded, null), null); // timeline too long to read: fail closed
 });
