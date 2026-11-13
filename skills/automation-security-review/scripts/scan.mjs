@@ -431,7 +431,7 @@ function scanPii(rel, text, synthetic) {
   for (const p of phi) {
     p.re.lastIndex = 0;
     while ((m = p.re.exec(text))) {
-      if (PLACEHOLDER.test(m[1]) || /^x+$/i.test(m[1])) continue;
+      if (PLACEHOLDER.test(m[1]) || /^x+$/i.test(m[1]) || !/\d/.test(m[1])) continue; // real ids carry digits; skips prose like 'medical record number'
       add(p.rule, down(p.rule.startsWith('PHI') ? 'critical' : 'warning'), rel, lineOf(text, m.index), shape(m[1], p.kind), m[1], tag);
     }
   }
