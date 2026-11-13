@@ -15,6 +15,9 @@ const CHECK_APP = "github-actions";
 const ACTIONS_BOT = "github-actions[bot]";
 const ARRIVAL_STATUS_PREFIX = "Head arrival (PR #";
 const STATUSES_PER_PAGE = 100;
+const FORCE_PUSH_EVENT = "head_ref_force_pushed";
+const TIMELINE_PER_PAGE = 100;
+const MAX_TIMELINE_PAGES = 20;
 // Required status on main. Only this workflow sets it, so a pull request cannot merge without /approve.
 const APPROVAL_STATUS = "Steward approval";
 // /approve only merges contributions. Anything else (workflows, scripts, docs) is merged by a maintainer.
@@ -164,6 +167,31 @@ export function headArrival(statuses, number) {
   return times.length > 0 ? Math.max(...times) : null;
 }
 
+// The arrival record is written a moment after the push. A force-push can put an earlier,
+// already recorded commit back as the head, and until the new record lands the old one would
+// make that commit look settled. GitHub timestamps every force-push itself, so the arrival is
+// the later of the record and the newest force-push. timeline is null when it could not be
+// read in full; with no record or no complete timeline the answer is null, which /approve refuses.
+export function effectiveArrival(recordedAt, timeline) {
+  if (recordedAt === null || timeline === null) return null;
+  const forcePushes = timeline
+    .filter((event) => event.event === FORCE_PUSH_EVENT)
+    .map((event) => Date.parse(event.created_at))
+    .filter(Number.isFinite);
+  return Math.max(recordedAt, ...forcePushes);
+}
+
+// Every timeline event of the pull request, or null when there are too many to read in full.
+async function timelineOf(api, number) {
+  const events = [];
+  for (let page = 1; page <= MAX_TIMELINE_PAGES; page += 1) {
+    const batch = await api("GET", `/issues/${number}/timeline?per_page=${TIMELINE_PER_PAGE}&page=${page}`);
+    events.push(...batch);
+    if (batch.length < TIMELINE_PER_PAGE) return events;
+  }
+  return null;
+}
+
 async function addLabel(api, number, name) {
   try {
     await api("POST", "/labels", { name, ...LABELS[name] });
@@ -212,7 +240,10 @@ async function main() {
   const { paths: changedPaths, listedFiles } = approving ? await changedPathsOf(api, PR_NUMBER) : { paths: [], listedFiles: 0 };
   const checkPassed = approving ? await requiredCheckPassed(api, pr.headSha) : false;
   const headArrivedAt = approving
-    ? headArrival(await api("GET", `/commits/${pr.headSha}/statuses?per_page=${STATUSES_PER_PAGE}`), PR_NUMBER)
+    ? effectiveArrival(
+        headArrival(await api("GET", `/commits/${pr.headSha}/statuses?per_page=${STATUSES_PER_PAGE}`), PR_NUMBER),
+        await timelineOf(api, PR_NUMBER),
+      )
     : null;
 
   const decision = decide({
