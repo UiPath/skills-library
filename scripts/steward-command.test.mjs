@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decide, filesOutsideContributions, headArrival, isSteward, parseCommand } from "./steward-command.mjs";
+import { decide, effectiveArrival, filesOutsideContributions, headArrival, isSteward, parseCommand } from "./steward-command.mjs";
 
 const STEWARD = 101;
 const OTHER_STEWARD = 102;
@@ -71,6 +71,20 @@ test("head arrival comes from this pull request's own record, newest first", () 
   assert.equal(headArrival(statuses, "7"), Date.parse("2026-01-01T11:00:00Z"));
   assert.equal(headArrival(statuses, "9"), null);
   assert.equal(headArrival([], "7"), null);
+});
+
+test("a force-push after the record makes the commit count as newly arrived", () => {
+  const recorded = Date.parse("2026-01-01T09:00:00Z");
+  const forcePush = (created_at) => ({ event: "head_ref_force_pushed", created_at });
+  const timeline = [{ event: "commented", created_at: "2026-01-01T11:59:00Z" }, forcePush("2026-01-01T10:00:00Z"), forcePush("2026-01-01T11:58:00Z")];
+  assert.equal(effectiveArrival(recorded, timeline), Date.parse("2026-01-01T11:58:00Z"));
+  assert.equal(effectiveArrival(recorded, [forcePush("2026-01-01T08:00:00Z")]), recorded);
+  assert.equal(effectiveArrival(recorded, []), recorded);
+  for (const event of ["reopened", "head_ref_restored", "head_ref_deleted"]) {
+    assert.equal(effectiveArrival(recorded, [{ event, created_at: "2026-01-01T11:00:00Z" }]), Date.parse("2026-01-01T11:00:00Z"));
+  }
+  assert.equal(effectiveArrival(null, timeline), null); // no record: fail closed
+  assert.equal(effectiveArrival(recorded, null), null); // timeline too long to read: fail closed
 });
 
 test("naming the commit approves it at once, and only if it is the latest", () => {
