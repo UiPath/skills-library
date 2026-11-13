@@ -1,0 +1,28 @@
+name: Record head commit
+
+# Records, with a GitHub-set timestamp, the moment a commit became the head of a pull request.
+# /approve reads this to refuse a commit that arrived just before the approval.
+# pull_request_target runs this file from the default branch. It checks out nothing and runs
+# no pull request code; the only inputs are the head commit id and the pull request number.
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  statuses: write
+
+jobs:
+  record:
+    name: Record head commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record arrival
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state=success \
+            -f context="Head arrival (PR #$PR_NUMBER)" \
+            -f description="Became the latest commit of pull request #$PR_NUMBER"

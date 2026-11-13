@@ -12,6 +12,9 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REQUIRED_CHECK = "Validate skills";
 const CHECK_APP = "github-actions";
+const ACTIONS_BOT = "github-actions[bot]";
+const ARRIVAL_STATUS_PREFIX = "Head arrival (PR #";
+const STATUSES_PER_PAGE = 100;
 // Required status on main. Only this workflow sets it, so a pull request cannot merge without /approve.
 const APPROVAL_STATUS = "Steward approval";
 // /approve only merges contributions. Anything else (workflows, scripts, docs) is merged by a maintainer.
@@ -52,9 +55,10 @@ export function filesOutsideContributions(paths) {
 // Decides what to do. Pure, so it can be tested without GitHub.
 // pr: { state, draft, authorId, headSha, changedFiles }; changedPaths, listedFiles and checkPassed are only
 // read for /approve. listedFiles is how many files the listing returned; changedFiles is GitHub's own count.
-// checkStartedAt is when GitHub started the check on the latest commit (set by GitHub, so it marks when the
-// commit arrived); commentedAt is when the steward commented. Both are epoch milliseconds.
-export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], listedFiles = 0, checkPassed = false, checkStartedAt = null, commentedAt = null }) {
+// headArrivedAt is when the latest commit became this pull request's head, as recorded by the
+// "Record head commit" workflow (null when there is no record); commentedAt is when the steward
+// commented. Both are epoch milliseconds.
+export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], listedFiles = 0, checkPassed = false, headArrivedAt = null, commentedAt = null }) {
   if (!parsed) return { action: "ignore", why: "no steward command" };
   if (!isSteward(commenterId, stewards)) return { action: "ignore", why: "the commenter is not a steward" };
   if (pr.state !== "open") return { action: "comment", message: "This pull request is not open, so there is nothing to approve or decline." };
@@ -91,10 +95,10 @@ export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], l
     return { action: "comment", message: `Cannot approve yet: the \`${REQUIRED_CHECK}\` check has not passed on the latest commit.` };
   }
   if (!namedCommit) {
-    const settled = Number.isFinite(checkStartedAt) && Number.isFinite(commentedAt) &&
-      commentedAt - checkStartedAt >= SETTLE_MINUTES * MS_PER_MINUTE;
+    const settled = Number.isFinite(headArrivedAt) && Number.isFinite(commentedAt) &&
+      commentedAt - headArrivedAt >= SETTLE_MINUTES * MS_PER_MINUTE;
     if (!settled) {
-      return { action: "comment", message: `The latest commit \`${latest}\` arrived less than ${SETTLE_MINUTES} minutes before your approval, so it may be newer than what you reviewed. Check **Files changed** again, then either comment \`/approve\` again in a few minutes or approve this exact commit now with \`/approve ${latest}\`.` };
+      return { action: "comment", message: `The latest commit \`${latest}\` arrived less than ${SETTLE_MINUTES} minutes before your approval, or its arrival time is not on record, so it may be newer than what you reviewed. Check **Files changed** again, then either comment \`/approve\` again in a few minutes or approve this exact commit now with \`/approve ${latest}\`.` };
     }
   }
   return { action: "approve" };
@@ -142,13 +146,22 @@ async function changedPathsOf(api, number) {
 
 // The check counts only when GitHub Actions reported it. With every changed file under skills/,
 // the workflow and validator that produced it are the ones on the default branch.
-// Returns whether it passed and when its latest run started.
-async function requiredCheck(api, sha) {
+async function requiredCheckPassed(api, sha) {
   const runs = await api("GET", `/commits/${sha}/check-runs?check_name=${encodeURIComponent(REQUIRED_CHECK)}&filter=latest`);
   const trusted = runs.check_runs.filter((run) => run.app?.slug === CHECK_APP);
-  const passed = trusted.length > 0 && trusted.every((run) => run.conclusion === "success");
-  const startedAt = passed ? Math.max(...trusted.map((run) => Date.parse(run.started_at))) : null;
-  return { passed, startedAt };
+  return trusted.length > 0 && trusted.every((run) => run.conclusion === "success");
+}
+
+// When this commit last became the head of this pull request, or null when there is no record.
+// The record is a commit status written by the "Record head commit" workflow. Its context names
+// the pull request, so the same commit sitting in another pull request or branch does not count,
+// and the newest record wins, so a commit that is pushed away and pushed back counts as new.
+export function headArrival(statuses, number) {
+  const times = statuses
+    .filter((status) => status.context === `${ARRIVAL_STATUS_PREFIX}${number})` && status.creator?.login === ACTIONS_BOT)
+    .map((status) => Date.parse(status.created_at))
+    .filter(Number.isFinite);
+  return times.length > 0 ? Math.max(...times) : null;
 }
 
 async function addLabel(api, number, name) {
@@ -197,11 +210,14 @@ async function main() {
 
   const approving = parsed?.command === "approve" && isSteward(commenterId, stewards) && pr.state === "open";
   const { paths: changedPaths, listedFiles } = approving ? await changedPathsOf(api, PR_NUMBER) : { paths: [], listedFiles: 0 };
-  const check = approving ? await requiredCheck(api, pr.headSha) : { passed: false, startedAt: null };
+  const checkPassed = approving ? await requiredCheckPassed(api, pr.headSha) : false;
+  const headArrivedAt = approving
+    ? headArrival(await api("GET", `/commits/${pr.headSha}/statuses?per_page=${STATUSES_PER_PAGE}`), PR_NUMBER)
+    : null;
 
   const decision = decide({
     parsed, commenterId, stewards, pr, changedPaths, listedFiles,
-    checkPassed: check.passed, checkStartedAt: check.startedAt, commentedAt: Date.parse(COMMENTED_AT),
+    checkPassed, headArrivedAt, commentedAt: Date.parse(COMMENTED_AT),
   });
   console.log(`decision: ${decision.action}${decision.why ? ` (${decision.why})` : ""}`);
 

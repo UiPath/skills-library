@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { decide, filesOutsideContributions, isSteward, parseCommand } from "./steward-command.mjs";
+import { decide, filesOutsideContributions, headArrival, isSteward, parseCommand } from "./steward-command.mjs";
 
 const STEWARD = 101;
 const OTHER_STEWARD = 102;
@@ -14,7 +14,7 @@ const minutesBefore = (minutes) => COMMENTED_AT - minutes * 60_000;
 const run = (body, overrides = {}) =>
   decide({
     parsed: parseCommand(body), commenterId: STEWARD, stewards, pr: openPr, changedPaths: skillPaths,
-    listedFiles: skillPaths.length, checkPassed: true, checkStartedAt: minutesBefore(60), commentedAt: COMMENTED_AT, ...overrides,
+    listedFiles: skillPaths.length, checkPassed: true, headArrivedAt: minutesBefore(60), commentedAt: COMMENTED_AT, ...overrides,
   });
 
 test("parseCommand reads the command and its argument", () => {
@@ -50,16 +50,31 @@ test("approve merges an open, ready, green skills pull request from someone else
 
 test("a plain approve uses the latest commit once it has settled", () => {
   assert.equal(run("/approve").action, "approve");
-  assert.equal(run("/approve", { checkStartedAt: minutesBefore(10) }).action, "approve");
-  const fresh = run("/approve", { checkStartedAt: minutesBefore(3) });
+  assert.equal(run("/approve", { headArrivedAt: minutesBefore(10) }).action, "approve");
+  const fresh = run("/approve", { headArrivedAt: minutesBefore(3) });
   assert.equal(fresh.action, "comment");
   assert.ok(fresh.message.includes(`/approve ${HEAD}`));
-  assert.equal(run("/approve", { checkStartedAt: minutesBefore(-1) }).action, "comment"); // pushed after the comment
-  assert.equal(run("/approve", { checkStartedAt: null }).action, "comment"); // unknown arrival time fails closed
+  assert.equal(run("/approve", { headArrivedAt: minutesBefore(-1) }).action, "comment"); // pushed after the comment
+  assert.equal(run("/approve", { headArrivedAt: null }).action, "comment"); // unknown arrival time fails closed
+});
+
+test("head arrival comes from this pull request's own record, newest first", () => {
+  const bot = { login: "github-actions[bot]" };
+  const status = (context, created_at, creator = bot) => ({ context, created_at, creator });
+  const statuses = [
+    status("Head arrival (PR #7)", "2026-01-01T11:00:00Z"),
+    status("Head arrival (PR #7)", "2026-01-01T09:00:00Z"),
+    status("Head arrival (PR #8)", "2026-01-01T11:30:00Z"), // same commit in another pull request
+    status("Head arrival (PR #7)", "2026-01-01T11:45:00Z", { login: "someone" }), // not written by the workflow
+    status("Validate skills", "2026-01-01T11:50:00Z"),
+  ];
+  assert.equal(headArrival(statuses, "7"), Date.parse("2026-01-01T11:00:00Z"));
+  assert.equal(headArrival(statuses, "9"), null);
+  assert.equal(headArrival([], "7"), null);
 });
 
 test("naming the commit approves it at once, and only if it is the latest", () => {
-  assert.equal(run(`/approve ${HEAD}`, { checkStartedAt: minutesBefore(1) }).action, "approve");
+  assert.equal(run(`/approve ${HEAD}`, { headArrivedAt: minutesBefore(1) }).action, "approve");
   assert.equal(run("/approve abc1234").action, "comment"); // a prefix could match a second, crafted commit
   const stale = run(`/approve ${"1".repeat(40)}`);
   assert.equal(stale.action, "comment");

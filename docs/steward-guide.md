@@ -52,7 +52,7 @@ You do not have to run the skill on a tenant to approve it. Running it end to en
 
 The bot takes the latest commit itself, squash-merges it, labels the pull request `approved`, and replies with the commit it merged.
 
-**If the contributor pushed in the last 10 minutes,** a plain `/approve` is refused, because that commit may be newer than what you read. Look at **Files changed** again, then either comment `/approve` again a few minutes later, or approve that exact commit straight away with the full id the bot showed you:
+**If the contributor pushed in the last 10 minutes,** a plain `/approve` is refused, because that commit may be newer than what you read. The same happens when the arrival time of the latest commit is not on record, for example on a pull request opened before this check existed. Look at **Files changed** again, then either comment `/approve` again a few minutes later, or approve that exact commit straight away with the full id the bot showed you:
 
 ```text
 /approve <FULL_COMMIT_ID>
