@@ -3,7 +3,7 @@
 // naming, SKILL.md frontmatter, recipe.json metadata, and the recipe seams guide.
 // No dependencies. Usage: node scripts/validate-skills.mjs [skillsDir]
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -83,7 +83,21 @@ function checkMetadata(meta, schema, folder, dir) {
   return errors;
 }
 
+// A symbolic link could point outside the skill folder, so none are allowed in a contribution.
+function symlinksIn(dir, prefix = "") {
+  const found = [];
+  for (const entry of readdirSync(dir)) {
+    const path = join(dir, entry);
+    const stats = lstatSync(path);
+    if (stats.isSymbolicLink()) found.push(prefix + entry);
+    else if (stats.isDirectory()) found.push(...symlinksIn(path, `${prefix}${entry}/`));
+  }
+  return found;
+}
+
 export function validateSkill(dir, folder, { schema, coreNames }) {
+  const links = symlinksIn(dir);
+  if (links.length > 0) return [`symbolic links are not allowed in a skill folder: ${links.join(", ")}`];
   const errors = [];
   if (!NAME_PATTERN.test(folder)) errors.push("folder name must be kebab-case (lowercase letters, digits, hyphens)");
   if (folder.startsWith(RESERVED_PREFIX)) errors.push(`names starting with "${RESERVED_PREFIX}" are reserved for the core repo, UiPath/skills`);
@@ -128,7 +142,7 @@ export function validateAll(skillsDir) {
     coreNames: readJson(join(ROOT, "assets", "core-skill-names.json")).names,
   };
   const folders = existsSync(skillsDir)
-    ? readdirSync(skillsDir).filter((entry) => statSync(join(skillsDir, entry)).isDirectory()).sort()
+    ? readdirSync(skillsDir).filter((entry) => lstatSync(join(skillsDir, entry)).isDirectory()).sort()
     : [];
   return folders.map((folder) => ({ folder, errors: validateSkill(join(skillsDir, folder), folder, context) }));
 }

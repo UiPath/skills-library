@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { test } from "node:test";
@@ -66,6 +66,13 @@ test("frontmatter and metadata problems are reported", () => {
   for (const expected of ["tier must be one of", 'unknown field "extra"', 'missing required field "cli_version"', "the limit is 1024", "body must contain the line"]) {
     assert.ok(errors.some((e) => e.includes(expected)), `expected an error containing: ${expected}`);
   }
+});
+
+test("symbolic links inside a skill folder are rejected", () => {
+  const errors = errorsFor("linked-skill", ({ dir }) => symlinkSync("/etc/hosts", join(dir, "references", "hosts.md")));
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0].includes("symbolic links are not allowed"));
+  assert.ok(errors[0].includes("references/hosts.md"));
 });
 
 test("a verified skill needs last_verified", () => {

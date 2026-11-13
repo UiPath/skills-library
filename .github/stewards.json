@@ -1,4 +1,8 @@
 {
   "team": "UiPath/skills-steward",
-  "logins": ["gabrielavaduva", "ibuzescu", "roalexandru"]
+  "stewards": [
+    { "login": "gabrielavaduva", "id": 48768017 },
+    { "login": "ibuzescu", "id": 50329605 },
+    { "login": "roalexandru", "id": 29518816 }
+  ]
 }

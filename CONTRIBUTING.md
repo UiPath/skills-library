@@ -46,19 +46,12 @@ Does not belong here: changes to a core skill (names starting with `uipath-`). O
 
 1. Automated checks run. If one fails, its output says what to fix.
 2. When checks pass, a steward reviews for safety and format. Expect a reply within 5 business days. Review is best-effort.
-3. The steward approves, or declines with a reason. A merged skill is listed as UiPath approved.
+3. The steward approves, or declines with a reason. A merged skill is listed as UiPath approved. A commit pushed after approval needs a new approval.
 4. On merge you become the owner of your skill folder in `CODEOWNERS`.
 
 ## For stewards
 
-Stewards are the people listed in `.github/stewards.json`, who are also the `@UiPath/skills-steward` team. Type one of these as a comment on a pull request, as the first word:
-
-| Comment | What happens |
-|---------|--------------|
-| `/approve` | The pull request is squash-merged and labeled `approved`. Needs the `Validate skills` check green on the latest commit. A steward cannot approve their own pull request. |
-| `/reject <reason>` | The reason is posted to the contributor, the pull request is labeled `declined` and closed. The reason is required. |
-
-Commands from anyone else are ignored. To add or remove a steward, change both the team and `.github/stewards.json`.
+Stewards approve with `/approve <commit>` and decline with `/reject <reason>`, typed as a pull request comment. The full process is in the [steward guide](docs/steward-guide.md).
 
 ## Owning a skill
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Handles the steward commands typed as a pull request comment:
-//   /approve            merge the pull request (squash)
+//   /approve <sha>      merge the pull request (squash) at the commit the steward reviewed
 //   /reject <reason>    post the reason, label and close the pull request
 // Run by .github/workflows/steward-commands.yml from the default branch.
 
@@ -10,40 +10,69 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REQUIRED_CHECK = "Validate skills";
+const CHECK_APP = "github-actions";
+// Required status on main. Only this workflow sets it, so a pull request cannot merge without /approve.
+const APPROVAL_STATUS = "Steward approval";
+// /approve only merges contributions. Anything else (workflows, scripts, docs) is merged by a maintainer.
+const CONTRIBUTION_ROOT = "skills/";
+const SHA_PATTERN = /^[0-9a-f]{7,40}$/;
+const SHORT_SHA = 7;
+const MERGE_ATTEMPTS = 4;
+const FILES_PER_PAGE = 100;
 const LABELS = {
   approved: { color: "1f8a5b", description: "Approved by a UiPath steward" },
   declined: { color: "b7791f", description: "Declined by a UiPath steward, with a reason" },
 };
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
-// The command must be the first word of the comment. Anything after /reject is the reason.
+// The command must be the first word of the comment. Everything after it is the argument:
+// the reviewed commit for /approve, the reason for /reject.
 export function parseCommand(body) {
   const match = /^\/(approve|reject)(?:[ \t]+([\s\S]*))?$/.exec(String(body ?? "").trim());
   if (!match) return null;
-  return { command: match[1], reason: (match[2] ?? "").trim() };
+  return { command: match[1], argument: (match[2] ?? "").trim() };
 }
 
-export function isSteward(login, logins) {
-  const wanted = String(login ?? "").toLowerCase();
-  return logins.some((entry) => entry.toLowerCase() === wanted);
+// Stewards are matched on the numeric account id: a login can be renamed and re-registered.
+export function isSteward(id, stewards) {
+  return Number.isInteger(id) && stewards.some((steward) => steward.id === id);
+}
+
+export function filesOutsideContributions(paths) {
+  return paths.filter((path) => !path.startsWith(CONTRIBUTION_ROOT));
 }
 
 // Decides what to do. Pure, so it can be tested without GitHub.
-export function decide({ parsed, commenter, stewards, pr, checkPassed }) {
+// pr: { state, draft, authorId, headSha }; changedPaths and checkPassed are only read for /approve.
+export function decide({ parsed, commenterId, stewards, pr, changedPaths = [], checkPassed = false }) {
   if (!parsed) return { action: "ignore", why: "no steward command" };
-  if (!isSteward(commenter, stewards)) return { action: "ignore", why: `${commenter} is not a steward` };
+  if (!isSteward(commenterId, stewards)) return { action: "ignore", why: "the commenter is not a steward" };
   if (pr.state !== "open") return { action: "comment", message: "This pull request is not open, so there is nothing to approve or decline." };
 
   if (parsed.command === "reject") {
-    if (!parsed.reason) {
+    if (!parsed.argument) {
       return { action: "comment", message: "A reason is required. Use `/reject <reason>` so the contributor knows what to change or where to go instead." };
     }
     return { action: "reject" };
   }
 
-  if (isSteward(pr.author, [commenter])) {
+  const latest = pr.headSha.slice(0, SHORT_SHA);
+  if (pr.authorId === commenterId) {
     return { action: "comment", message: "Stewards cannot `/approve` their own pull request. Ask another steward." };
   }
   if (pr.draft) return { action: "comment", message: "This pull request is still a draft. Mark it ready for review first." };
+  const sha = parsed.argument.toLowerCase();
+  if (!SHA_PATTERN.test(sha)) {
+    return { action: "comment", message: `Name the commit you reviewed. The latest commit is \`${latest}\`: review it, then comment \`/approve ${latest}\`.` };
+  }
+  if (!pr.headSha.startsWith(sha)) {
+    return { action: "comment", message: `\`${sha}\` is not the latest commit, so new changes arrived after your review. The latest commit is \`${latest}\`: review it, then comment \`/approve ${latest}\`.` };
+  }
+  const outside = filesOutsideContributions(changedPaths);
+  if (outside.length > 0) {
+    const shown = outside.slice(0, 5).map((path) => `\`${path}\``).join(", ");
+    return { action: "comment", message: `\`/approve\` only merges changes under \`${CONTRIBUTION_ROOT}\`. This pull request also changes ${shown}${outside.length > 5 ? " and more" : ""}, so a maintainer has to merge it.` };
+  }
   if (!checkPassed) {
     return { action: "comment", message: `Cannot approve yet: the \`${REQUIRED_CHECK}\` check has not passed on the latest commit.` };
   }
@@ -74,6 +103,27 @@ function client(token, repository) {
   };
 }
 
+// Every path the pull request touches, including the old path of a rename.
+async function changedPathsOf(api, number) {
+  const paths = [];
+  for (let page = 1; ; page += 1) {
+    const files = await api("GET", `/pulls/${number}/files?per_page=${FILES_PER_PAGE}&page=${page}`);
+    for (const file of files) {
+      paths.push(file.filename);
+      if (file.previous_filename) paths.push(file.previous_filename);
+    }
+    if (files.length < FILES_PER_PAGE) return paths;
+  }
+}
+
+// The check counts only when GitHub Actions reported it. With every changed file under skills/,
+// the workflow and validator that produced it are the ones on the default branch.
+async function requiredCheckPassed(api, sha) {
+  const runs = await api("GET", `/commits/${sha}/check-runs?check_name=${encodeURIComponent(REQUIRED_CHECK)}&filter=latest`);
+  const trusted = runs.check_runs.filter((run) => run.app?.slug === CHECK_APP);
+  return trusted.length > 0 && trusted.every((run) => run.conclusion === "success");
+}
+
 async function addLabel(api, number, name) {
   try {
     await api("POST", "/labels", { name, ...LABELS[name] });
@@ -83,37 +133,64 @@ async function addLabel(api, number, name) {
   await api("POST", `/issues/${number}/labels`, { labels: [name] });
 }
 
+// Sets the approval status, merges, and withdraws the status if the merge does not happen,
+// so an approval never outlives a failed merge.
+async function approveAndMerge(api, number, sha, approver) {
+  const setStatus = (state, description) =>
+    api("POST", `/statuses/${sha}`, { state, context: APPROVAL_STATUS, description });
+  await setStatus("success", `Approved by ${approver}`);
+  try {
+    // Passing the head sha makes the merge fail if a commit landed after the approval.
+    // The branch rules can take a moment to see the new status, so retry a refused merge.
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await api("PUT", `/pulls/${number}/merge`, { merge_method: "squash", sha });
+        return;
+      } catch (error) {
+        if (error.status !== 405 || attempt === MERGE_ATTEMPTS) throw error;
+        await sleep(5000);
+      }
+    }
+  } catch (error) {
+    await setStatus("failure", "Approval withdrawn: the merge did not complete");
+    throw error;
+  }
+}
+
 async function main() {
-  const { GITHUB_TOKEN, GITHUB_REPOSITORY, COMMENT_BODY, COMMENTER, PR_NUMBER } = process.env;
+  const { GITHUB_TOKEN, GITHUB_REPOSITORY, COMMENT_BODY, COMMENTER, COMMENTER_ID, PR_NUMBER } = process.env;
   const api = client(GITHUB_TOKEN, GITHUB_REPOSITORY);
   const comment = (message) => api("POST", `/issues/${PR_NUMBER}/comments`, { body: message });
 
   const parsed = parseCommand(COMMENT_BODY);
-  const stewards = JSON.parse(readFileSync(join(ROOT, ".github", "stewards.json"), "utf8")).logins;
+  const commenterId = Number(COMMENTER_ID);
+  const stewards = JSON.parse(readFileSync(join(ROOT, ".github", "stewards.json"), "utf8")).stewards;
   const pull = await api("GET", `/pulls/${PR_NUMBER}`);
-  const pr = { state: pull.state, draft: pull.draft, author: pull.user.login };
+  const pr = { state: pull.state, draft: pull.draft, authorId: pull.user.id, headSha: pull.head.sha };
 
-  let checkPassed = false;
-  if (parsed?.command === "approve") {
-    const runs = await api("GET", `/commits/${pull.head.sha}/check-runs?check_name=${encodeURIComponent(REQUIRED_CHECK)}&filter=latest`);
-    checkPassed = runs.check_runs.length > 0 && runs.check_runs.every((run) => run.conclusion === "success");
-  }
+  const approving = parsed?.command === "approve" && isSteward(commenterId, stewards) && pr.state === "open";
+  const changedPaths = approving ? await changedPathsOf(api, PR_NUMBER) : [];
+  const checkPassed = approving ? await requiredCheckPassed(api, pr.headSha) : false;
 
-  const decision = decide({ parsed, commenter: COMMENTER, stewards, pr, checkPassed });
+  const decision = decide({ parsed, commenterId, stewards, pr, changedPaths, checkPassed });
   console.log(`decision: ${decision.action}${decision.why ? ` (${decision.why})` : ""}`);
 
   if (decision.action === "comment") {
     await comment(decision.message);
   } else if (decision.action === "reject") {
-    const quoted = parsed.reason.split(/\r?\n/).map((line) => `> ${line}`).join("\n");
-    await comment(`Declined by @${COMMENTER}.\n\n${quoted}\n\nThanks for contributing, @${pr.author}. You can open a new pull request once this is addressed.`);
+    const quoted = parsed.argument.split(/\r?\n/).map((line) => `> ${line}`).join("\n");
+    await comment(`Declined by @${COMMENTER}.\n\n${quoted}\n\nThanks for contributing, @${pull.user.login}. You can open a new pull request once this is addressed.`);
     await addLabel(api, PR_NUMBER, "declined");
     await api("PATCH", `/pulls/${PR_NUMBER}`, { state: "closed" });
   } else if (decision.action === "approve") {
-    // Passing the head sha makes the merge fail if a commit landed after the check ran.
-    await api("PUT", `/pulls/${PR_NUMBER}/merge`, { merge_method: "squash", sha: pull.head.sha });
+    try {
+      await approveAndMerge(api, PR_NUMBER, pr.headSha, COMMENTER);
+    } catch (error) {
+      await comment(`The approval was recorded but the merge did not complete, so the approval was withdrawn. Check the pull request for conflicts or new commits, then \`/approve\` again.`);
+      throw error;
+    }
     await addLabel(api, PR_NUMBER, "approved");
-    await comment(`Approved by @${COMMENTER} and merged. Thanks, @${pr.author}: this is now a UiPath-approved community skill.`);
+    await comment(`Approved by @${COMMENTER} and merged. Thanks, @${pull.user.login}: this is now a UiPath-approved community skill.`);
   }
 }
 
