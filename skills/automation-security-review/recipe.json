@@ -1,0 +1,11 @@
+{
+  "$schema": "../../schemas/recipe.schema.json",
+  "name": "automation-security-review",
+  "kind": "skill",
+  "authors": [
+    { "github": "ibuzescu", "name": "Ioana Buzescu", "organization": "UiPath" }
+  ],
+  "products": ["Studio", "Orchestrator", "Agents", "Coded Apps", "Maestro", "LLM Gateway"],
+  "tier": "community",
+  "cli_version": "1.205.0"
+}
