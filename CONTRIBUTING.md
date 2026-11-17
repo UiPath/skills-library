@@ -59,7 +59,7 @@ You own what you contribute. When the `uip` CLI changes and your skill breaks, a
 
 ## Sign-off and license
 
-Contributions are licensed under [MIT](LICENSE). Sign off each commit with `git commit -s` to certify the [Developer Certificate of Origin](https://developercertificate.org/): you wrote it, or you have the right to submit it.
+Contributions are licensed under the [Apache License 2.0](LICENSE). Sign off each commit with `git commit -s` to certify the [Developer Certificate of Origin](https://developercertificate.org/): you wrote it, or you have the right to submit it.
 
 ## Conduct and security
 

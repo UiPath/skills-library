@@ -5,7 +5,7 @@
   "author": {
     "name": "UiPath community"
   },
-  "license": "MIT",
+  "license": "Apache-2.0",
   "homepage": "https://github.com/UiPath/skills-library",
   "repository": "https://github.com/UiPath/skills-library",
   "keywords": ["uipath", "automation", "skills", "recipes", "community"],

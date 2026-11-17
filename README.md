@@ -69,4 +69,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). Review is best-effort: a steward replies
 
 ## License
 
-[MIT](LICENSE)
+[Apache License 2.0](LICENSE)

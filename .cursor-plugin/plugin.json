@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/UiPath/skills-library",
   "repository": "https://github.com/UiPath/skills-library",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "keywords": ["uipath", "automation", "skills", "recipes", "community"],
   "logo": "assets/uipath-icon.png"
 }

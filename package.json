@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "description": "Community-contributed skills and multi-product recipes for UiPath coding agents.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/UiPath/skills-library.git"
