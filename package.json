@@ -30,8 +30,7 @@
     ".agents/plugins",
     "gemini-extension.json",
     "README.md",
-    "LICENSE",
-    "CODEOWNERS"
+    "LICENSE"
   ],
   "scripts": {
     "validate": "node scripts/validate-skills.mjs",
