@@ -69,12 +69,16 @@ jobs:
         env:
           MINOR_OVERRIDE: ${{ github.event.inputs.minor_override }}
         run: |
+          set -euo pipefail
           CURRENT_LINE=$(jq -r '.version | split(".") | "\(.[0]).\(.[1])"' package.json)
           echo "current_line=$CURRENT_LINE" >> "$GITHUB_OUTPUT"
 
           if [ -n "$MINOR_OVERRIDE" ]; then
-            if ! echo "$MINOR_OVERRIDE" | grep -Eq '^[0-9]+\.[0-9]+$'; then
-              echo "::error::minor_override '$MINOR_OVERRIDE' is not MAJOR.MINOR."
+            # Bash =~ matches the whole string, unlike grep, which passes a
+            # multi-line value whose first line matches. A newline here would
+            # forge extra step outputs.
+            if [[ ! "$MINOR_OVERRIDE" =~ ^[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::minor_override is not MAJOR.MINOR."
               exit 1
             fi
             CUT_LINE="$MINOR_OVERRIDE"
@@ -127,14 +131,19 @@ jobs:
 
       - name: Dry run — print plan
         if: steps.target.outputs.proceed == 'true' && github.event.inputs.dry_run == 'true'
+        # Step outputs reach the shell through env, never through ${{ }} in the script.
+        env:
+          CURRENT_LINE: ${{ steps.target.outputs.current_line }}
+          CUT_LINE: ${{ steps.target.outputs.cut_line }}
+          NEXT_LINE: ${{ steps.target.outputs.next_line }}
         run: |
           {
             echo "## Dry run — planned sprint cut"
             echo ""
-            echo "- current line (main): \`${{ steps.target.outputs.current_line }}\`"
-            echo "- cut line: \`${{ steps.target.outputs.cut_line }}\` — branch \`release/v${{ steps.target.outputs.cut_line }}\` @ \`$(git rev-parse --short HEAD)\` at version \`${{ steps.target.outputs.cut_line }}.0\`"
+            echo "- current line (main): \`$CURRENT_LINE\`"
+            echo "- cut line: \`$CUT_LINE\` — branch \`release/v$CUT_LINE\` @ \`$(git rev-parse --short HEAD)\` at version \`$CUT_LINE.0\`"
             echo "- would publish (and wait): dev to GitHub Packages, preview to npmjs — stable stays manual"
-            echo "- would open a bump PR: \`main\` -> \`${{ steps.target.outputs.next_line }}.0\`"
+            echo "- would open a bump PR: \`main\` -> \`$NEXT_LINE.0\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cut release branch
@@ -278,11 +287,19 @@ jobs:
 
       - name: Summary
         if: always() && steps.target.outputs.proceed == 'true' && github.event.inputs.dry_run != 'true'
+        env:
+          CUT_LINE: ${{ steps.target.outputs.cut_line }}
+          NEXT_LINE: ${{ steps.target.outputs.next_line }}
+          SHORT_SHA: ${{ steps.cutbranch.outputs.short_sha }}
+          CUT_OUTCOME: ${{ steps.cutbranch.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          PREVIEW_VERSION: ${{ steps.publish.outputs.preview_version }}
+          BUMP_URL: ${{ steps.mainbump.outputs.url }}
         run: |
           {
             echo "## Sprint cut"
             echo ""
-            echo "- cut line: \`${{ steps.target.outputs.cut_line }}\` — \`release/v${{ steps.target.outputs.cut_line }}\` @ \`${{ steps.cutbranch.outputs.short_sha }}\` (${{ steps.cutbranch.outcome }})"
-            echo "- dev + preview publish: ${{ steps.publish.outcome }} ${{ steps.publish.outputs.preview_version }}"
-            echo "- bump PR (-> \`${{ steps.target.outputs.next_line }}.0\`): ${{ steps.mainbump.outputs.url }}"
+            echo "- cut line: \`$CUT_LINE\` — \`release/v$CUT_LINE\` @ \`$SHORT_SHA\` ($CUT_OUTCOME)"
+            echo "- dev + preview publish: $PUBLISH_OUTCOME $PREVIEW_VERSION"
+            echo "- bump PR (-> \`$NEXT_LINE.0\`): $BUMP_URL"
           } >> "$GITHUB_STEP_SUMMARY"
