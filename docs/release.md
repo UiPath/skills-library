@@ -72,7 +72,7 @@ A fix goes to `main` first, then is cherry-picked to `release/v<M.N>` in a pull 
 
 ## One-time setup
 
-Done once before the first publish: steps 1–4 by a GitHub admin of the `UiPath` organization, steps 5–8 by an owner of the `@uipath` npm organization.
+Done once before the first publish: steps 1–4 by a GitHub admin of the `UiPath` organization, steps 5–8 by an owner of the `@uipath` npm organization. Do them in order, after the pull request that added this file is merged, and before the first sprint cut.
 
 ### GitHub
 
@@ -85,6 +85,7 @@ Done once before the first publish: steps 1–4 by a GitHub admin of the `UiPath
 
 5. **Create the package.** npm only lets you add a trusted publisher to a package that exists, so the first version goes up by hand. Publish it as a preview from `main`, so no stable version gets ahead of the core repo:
    ```bash
+   git checkout main && git pull
    npm login
    npm version "$(node -p "require('./package.json').version")-preview.0" --no-git-tag-version
    npm publish --access public --tag preview
