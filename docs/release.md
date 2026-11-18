@@ -69,31 +69,3 @@ This publishes the committed `package.json` version of the release branch to `la
 ### Hotfixes
 
 A fix goes to `main` first, then is cherry-picked to `release/v<M.N>` in a pull request, with a patch bump (`M.N.1`) and `npm run version:sync`. The merge publishes a new `preview`; promote it as above.
-
-## One-time setup
-
-Done once before the first publish: steps 1–4 by a GitHub admin of the `UiPath` organization, steps 5–8 by an owner of the `@uipath` npm organization. Do them in order, after the pull request that added this file is merged, and before the first sprint cut.
-
-### GitHub
-
-1. **Make the repository public.** Provenance needs it, and `package.json` `repository.url` must match it.
-2. **Let the workflows do their jobs.** In **Settings** → **Actions** → **General**, keep **Workflow permissions** read-only, and turn on **Allow GitHub Actions to create and approve pull requests**: the sprint cut opens the version-bump PR with `GITHUB_TOKEN`.
-3. **Protect the release lines.** In **Settings** → **Rules** → **Rulesets**, add a ruleset for `release/v*` that restricts creations and updates, blocks force pushes and deletion, and requires a pull request and the `Validate skills` check. Give bypass only to the release-owner team and to GitHub Actions, which creates the branch during the cut. Protect `main` the same way, without the Actions bypass: the cut never pushes to `main`.
-4. **Create the `npm-publish` environment.** In **Settings** → **Environments** → **New environment**, name it `npm-publish`, and under **Deployment branches and tags** choose **Selected branches and tags** with the rules `main` and `release/v*`. Required reviewers are optional: with them, every npmjs publish waits for an approval, including the preview each sprint cut publishes.
-
-### npmjs
-
-5. **Create the package.** npm only lets you add a trusted publisher to a package that exists, so the first version goes up by hand. Publish it as a preview from `main`, so no stable version gets ahead of the core repo:
-   ```bash
-   git checkout main && git pull
-   npm login
-   npm version "$(node -p "require('./package.json').version")-preview.0" --no-git-tag-version
-   npm publish --access public --tag preview
-   git checkout package.json
-   ```
-   A brand-new package has no other version, so npm may also point `latest` at this one. The first stable promotion replaces it.
-6. **Add the trusted publisher.** Open `@uipath/skills-library` → **Settings** → **Trusted publishing** → **GitHub Actions**, and enter organization `UiPath`, repository `skills-library`, workflow `publish.yml`, environment `npm-publish`. The environment is what stops a run from any other branch from publishing: a dispatch runs the workflow file from the chosen branch, so a check inside the file alone can be edited away.
-7. **Lock token publishing.** In the same settings, set **Publishing access** to require two-factor authentication and disallow tokens, so only the workflow can publish.
-8. **Give the release-owner team access.** In the `@uipath` organization's **Teams**, give that team read-write access to the package, so publishing never depends on one person.
-
-GitHub Packages needs no setup: the `dev` job publishes with `GITHUB_TOKEN`, and the package appears under the UiPath organization after the first push to `main`. The repository holds no npm token.
