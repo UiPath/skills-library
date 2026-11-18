@@ -11,7 +11,7 @@ This repo holds community-contributed skills for UiPath. Read [CONTRIBUTING.md](
 - `.github/stewards.json`, `scripts/steward-command.mjs`, `docs/steward-guide.md` — who may approve, the `/approve` and `/reject` commands, and the steward process.
 - `archived/` — skills removed from the install path. Never install from here.
 - `.claude-plugin/`, `.cursor-plugin/`, `.codex-plugin/`, `.agents/plugins/`, `gemini-extension.json` — per-agent plugin manifests. All carry the same name (`uipath-library`) and the `package.json` version. Bump `package.json` only, then run `npm run version:sync`.
-- `.github/workflows/publish.yml`, `scripts/sync-version.mjs`, `docs/release.md` — npm publishing of `@uipath/skills-library` and the release process.
+- `.github/workflows/publish.yml`, `.github/workflows/sprint-release-cut.yml`, `scripts/sync-version.mjs`, `docs/release.md` — npm publishing of `@uipath/skills-library` and the release cycle, which follows [UiPath/skills](https://github.com/UiPath/skills): same version line, same biweekly cut.
 
 ## Rules
 
