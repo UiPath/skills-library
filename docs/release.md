@@ -57,8 +57,9 @@ Done once by an `@uipath` npm organization owner before the first publish.
    npm login
    npm publish --access public --tag latest
    ```
-2. **Add the trusted publisher.** On npmjs.com, open `@uipath/skills-library` → **Settings** → **Trusted publishing** → **GitHub Actions**, and enter organization `UiPath`, repository `skills-library`, workflow `publish.yml`. Leave the environment empty.
-3. **Lock token publishing.** In the same settings, set **Publishing access** to require two-factor authentication and disallow tokens, so only the workflow can publish.
-4. **GitHub Packages.** No setup: the `dev` job publishes with the workflow's `GITHUB_TOKEN`. The package appears under the UiPath organization after the first push to `main`.
+2. **Create the `npm-publish` environment.** In the GitHub repository, open **Settings** → **Environments** → **New environment**, name it `npm-publish`, and under **Deployment branches and tags** choose **Selected branches and tags** with the rules `main` and `release/v*`. Optionally add required reviewers, so every npmjs publish waits for an approval.
+3. **Add the trusted publisher.** On npmjs.com, open `@uipath/skills-library` → **Settings** → **Trusted publishing** → **GitHub Actions**, and enter organization `UiPath`, repository `skills-library`, workflow `publish.yml`, environment `npm-publish`. The environment is what stops a run from any other branch from publishing: a dispatch runs the workflow file from the chosen branch, so a check inside the file alone can be edited away.
+4. **Lock token publishing.** In the same settings, set **Publishing access** to require two-factor authentication and disallow tokens, so only the workflow can publish.
+5. **GitHub Packages.** No setup: the `dev` job publishes with the workflow's `GITHUB_TOKEN`. The package appears under the UiPath organization after the first push to `main`.
 
 The repository holds no npm token. Provenance needs the repository to be public and `package.json` `repository.url` to match it.

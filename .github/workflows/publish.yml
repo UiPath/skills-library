@@ -48,9 +48,11 @@ jobs:
   publish-dev:
     name: Publish dev to GitHub Packages
     needs: [guard]
-    # The repo guard stops forks from publishing on their own main.
+    # The repo guard stops forks from publishing on their own main. A dispatch runs
+    # the workflow file from the chosen ref, so only main and release lines publish.
     if: >-
       github.repository == 'UiPath/skills-library'
+      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/v'))
       && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
           || (github.event_name == 'workflow_dispatch' && github.event.inputs.channel == 'dev'))
     runs-on: ubuntu-latest
@@ -83,16 +85,25 @@ jobs:
   publish-npmjs:
     name: Publish to npmjs (latest / preview)
     needs: [guard]
+    # Stable ships only from a release line. The ref check fails fast; the real gate
+    # is the environment, which a branch cannot remove by editing this file.
     if: >-
       github.repository == 'UiPath/skills-library'
-      && ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
+      && ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))
           || (github.event_name == 'workflow_dispatch'
-              && (github.event.inputs.channel == 'latest' || github.event.inputs.channel == 'preview')))
+              && ((github.event.inputs.channel == 'latest' && startsWith(github.ref, 'refs/heads/release/v'))
+                  || (github.event.inputs.channel == 'preview'
+                      && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/v'))))))
     runs-on: ubuntu-latest
+    # Its deployment-branch policy (main, release/v*) is enforced by GitHub, and the
+    # npmjs trusted publisher requires this environment, so an OIDC token minted
+    # from any other branch, or from a copy of this file without it, is refused.
+    environment: npm-publish
     permissions:
       contents: read
       # OIDC trusted publishing: the npmjs trusted publisher for @uipath/skills-library
-      # must name this repo (UiPath/skills-library) and this workflow (publish.yml).
+      # must name this repo (UiPath/skills-library), this workflow (publish.yml) and
+      # the npm-publish environment.
       id-token: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
