@@ -1,0 +1,173 @@
+name: Publish package
+
+# Channels (see docs/release.md). Registry follows channel:
+#   - push to `main`                       -> `dev`     : GitHub Packages, `<base>-dev.<run>`
+#   - push to `release/v*`                 -> `preview` : npmjs, `<base>-preview.<run>`
+#   - workflow_dispatch (channel: latest)  -> `latest`  : npmjs, the committed package.json version
+#   - workflow_dispatch (channel: preview) -> `preview` : npmjs
+#   - workflow_dispatch (channel: dev)     -> `dev`     : GitHub Packages
+#
+# Stamped versions are never committed. Stable is manual-only. npmjs publishes use
+# OIDC trusted publishing with --provenance, so the repo holds no npm token.
+# `npm install @uipath/skills-library` with no tag always resolves the last stable.
+
+on:
+  push:
+    branches: [main, 'release/v*']
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Publish channel"
+        required: true
+        default: preview
+        type: choice
+        options: [preview, dev, latest]
+
+# One publish per channel at a time; never cancel one in flight.
+concurrency:
+  group: publish-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.channel || (github.ref == 'refs/heads/main' && 'dev' || 'preview') }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    # Not named like the PR check, so the required context on the merge commit stays unambiguous.
+    name: Publish guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 22
+      - run: npm test
+      - run: npm run version:check
+      - run: npm run validate
+
+  publish-dev:
+    name: Publish dev to GitHub Packages
+    needs: [guard]
+    # The repo guard stops forks from publishing on their own main.
+    if: >-
+      github.repository == 'UiPath/skills-library'
+      && ((github.event_name == 'push' && github.ref == 'refs/heads/main')
+          || (github.event_name == 'workflow_dispatch' && github.event.inputs.channel == 'dev'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 22
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@uipath"
+
+      - name: Stamp dev version
+        env:
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          BASE=$(node -p "require('./package.json').version")
+          npm version "${BASE}-dev.${RUN_NUMBER}" --no-git-tag-version --allow-same-version
+          npm run version:sync
+          echo "Publishing ${BASE}-dev.${RUN_NUMBER} to dist-tag dev"
+
+      # GitHub Packages does not support --provenance.
+      - name: Publish
+        run: npm publish --tag dev
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npmjs:
+    name: Publish to npmjs (latest / preview)
+    needs: [guard]
+    if: >-
+      github.repository == 'UiPath/skills-library'
+      && ((github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/'))
+          || (github.event_name == 'workflow_dispatch'
+              && (github.event.inputs.channel == 'latest' || github.event.inputs.channel == 'preview')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC trusted publishing: the npmjs trusted publisher for @uipath/skills-library
+      # must name this repo (UiPath/skills-library) and this workflow (publish.yml).
+      id-token: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
+        with:
+          node-version: 22
+
+      # Node 22 ships npm 10; trusted publishing needs npm >= 11.5.1. Pinned to a major
+      # so a new npm major is a deliberate edit, not a surprise on release day.
+      - name: Upgrade npm for trusted publishing
+        run: |
+          npm install -g npm@12
+          echo "npm $(npm --version) / node $(node --version)"
+
+      # Only the highest release line owns the bare `preview` tag; a lower line (a
+      # hotfix on an older release/v*) publishes to `preview-v<M.N>` instead. Fails
+      # open: an unset tag or unreachable registry keeps `preview`.
+      - name: Resolve dist-tag and stamp version
+        id: dist
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUBLISH_REF: ${{ github.ref }}
+          CHANNEL: ${{ github.event.inputs.channel }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          if [ "$CHANNEL" = "latest" ]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "Publishing $(node -p "require('./package.json').version") to dist-tag latest"
+            exit 0
+          fi
+          BASE=$(node -p "require('./package.json').version")
+          PREVIEW="${BASE}-preview.${RUN_NUMBER}"
+          npm version "$PREVIEW" --no-git-tag-version --allow-same-version
+          npm run version:sync
+          TAG=preview
+          CURRENT=$(npm view "@uipath/skills-library@preview" version --registry=https://registry.npmjs.org/ 2>/dev/null || true)
+          if [ -n "$CURRENT" ]; then
+            HIGHEST=$({ echo "${CURRENT%%-*}"; echo "$BASE"; } | sort -V | tail -1)
+            if [ "$HIGHEST" != "$BASE" ]; then
+              TAG="preview-v${BASE%.*}"
+            fi
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Publishing $PREVIEW to dist-tag $TAG (preview is at ${CURRENT:-unset})"
+
+      # Pack first and publish that exact tarball, so the bytes checked are the bytes published.
+      - name: Pack
+        id: pack
+        run: |
+          rm -f uipath-skills-library-*.tgz
+          npm pack --pack-destination .
+          TARBALL=$(ls uipath-skills-library-*.tgz)
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          tar -tzf "$TARBALL" | sort
+
+      # archived/ and templates/ must never reach an install path.
+      - name: Check tarball contents
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          LIST=$(tar -tzf "$TARBALL")
+          for required in package/.claude-plugin/plugin.json package/skills/; do
+            echo "$LIST" | grep -q "^${required}" || { echo "::error::$required missing from $TARBALL"; exit 1; }
+          done
+          if echo "$LIST" | grep -E '^package/(archived|templates|scripts|\.github)/'; then
+            echo "::error::$TARBALL ships files outside the install path"; exit 1
+          fi
+
+      # No token and no setup-node registry-url: a token would make npm skip OIDC.
+      # --provenance needs a public repo, id-token: write, and a matching repository.url.
+      - name: Publish to npmjs (OIDC trusted publishing)
+        env:
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          DIST_TAG: ${{ steps.dist.outputs.tag }}
+        run: |
+          npm publish "./$TARBALL" \
+            --registry https://registry.npmjs.org/ \
+            --access public --provenance --tag "$DIST_TAG"

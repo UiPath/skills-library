@@ -21,5 +21,9 @@ jobs:
           node-version: 20
       - name: Validator tests
         run: npm test
+      # Same command as the guard in publish.yml, so drift fails here, before merge,
+      # instead of silently blocking every publish after it.
+      - name: Plugin manifests match package.json
+        run: npm run version:check
       - name: Validate every skill folder
         run: npm run validate
