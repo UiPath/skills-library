@@ -74,3 +74,17 @@ test("a marketplace with no plugin entry is an error", () => {
     assert.ok(errors.some((e) => e.includes("no plugins[] entry")));
   });
 });
+
+test("a malformed version is an error, never compared", () => {
+  withRepo((root) => {
+    editJson(root, "gemini-extension.json", (doc) => (doc.version = "1.x.0"));
+    const { errors } = syncVersions(root, { write: true });
+    assert.ok(errors.some((e) => e.startsWith("gemini-extension.json") && e.includes("not M.N.P")));
+    assert.equal(readJson(root, "gemini-extension.json").version, "1.x.0");
+  });
+  withRepo((root) => {
+    editJson(root, "package.json", (pkg) => (pkg.version = "1.208"));
+    const { errors } = syncVersions(root, { write: true });
+    assert.ok(errors.some((e) => e.startsWith("package.json")));
+  });
+});

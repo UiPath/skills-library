@@ -30,6 +30,10 @@ const writeJson = (path, doc) => writeFileSync(path, `${JSON.stringify(doc, null
 // `1.2.0-dev.42` -> `1.2.0`
 export const baseVersion = (version) => version.split("-")[0];
 
+// M.N.P with an optional pre-release stamp. Anything else would compare as garbage.
+const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
+export const isVersion = (version) => typeof version === "string" && VERSION.test(version);
+
 function compareBase(a, b) {
   const pa = baseVersion(a).split(".").map(Number);
   const pb = baseVersion(b).split(".").map(Number);
@@ -40,7 +44,9 @@ function compareBase(a, b) {
 // Returns { version, drift: ["file: old -> new"], errors: [...] }. Writes only when
 // `write` is true and there are no errors.
 export function syncVersions(root, { write = false } = {}) {
-  const version = baseVersion(readJson(join(root, "package.json")).version);
+  const raw = readJson(join(root, "package.json")).version;
+  if (!isVersion(raw)) return { version: raw, drift: [], errors: [`package.json: version ${JSON.stringify(raw)} is not M.N.P`] };
+  const version = baseVersion(raw);
   const drift = [];
   const errors = [];
   const writes = [];
@@ -59,8 +65,13 @@ export function syncVersions(root, { write = false } = {}) {
       holder = doc.plugins[0];
     }
     if (holder.version === version) continue;
+    // A missing version is filled in; a malformed one cannot be compared, so it is never overwritten.
+    if (holder.version !== undefined && !isVersion(holder.version)) {
+      errors.push(`${file}: version ${JSON.stringify(holder.version)} is not M.N.P; fix it by hand`);
+      continue;
+    }
     // Plugin auto-update never goes backwards, so a lower version would freeze users.
-    if (typeof holder.version === "string" && compareBase(version, holder.version) < 0) {
+    if (holder.version !== undefined && compareBase(version, holder.version) < 0) {
       errors.push(`${file}: refusing to downgrade ${holder.version} to package.json ${version}`);
       continue;
     }

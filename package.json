@@ -36,6 +36,7 @@
     "validate": "node scripts/validate-skills.mjs",
     "test": "node --test scripts/validate-skills.test.mjs scripts/steward-command.test.mjs scripts/sync-version.test.mjs",
     "version:sync": "node scripts/sync-version.mjs",
-    "version:check": "node scripts/sync-version.mjs --check"
+    "version:check": "node scripts/sync-version.mjs --check",
+    "content:check": "python3 scripts/check-sensitive-content.py"
   }
 }
