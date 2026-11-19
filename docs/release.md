@@ -43,7 +43,7 @@ Stamped versions are never committed. `npm install @uipath/skills-library` with 
 
 The publish reads the current tags from npmjs first and stops if it cannot.
 
-Every publish first runs the guard: tests, `version:check` and `npm run validate`. The npmjs job then packs the tarball, checks it contains the plugin manifests and `skills/` but nothing from `archived/`, `templates/`, `scripts/` or `.github/`, scans it with `scripts/check-sensitive-content.py`, and publishes that exact file with `--provenance`.
+Every publish first runs the guard: tests, `version:check`, `npm run validate` and `npm run content:check`. The npmjs job then packs the tarball, checks it contains the plugin manifests and `skills/` but nothing from `archived/`, `templates/`, `scripts/` or `.github/`, scans it with `scripts/check-sensitive-content.py`, and publishes that exact file with `--provenance`.
 
 The scan is the core repo's. Customers run the package through DLP-style scanners that reject it on one card number, SSN, phone number, street address, card expiry date or token, matched by shape. Any finding blocks the publish; the `Validate skills` check runs the same scan on every pull request. A value that must stay verbatim and that customers do not flag goes in `scripts/sensitive-content-allowlist.json` with a reason.
 

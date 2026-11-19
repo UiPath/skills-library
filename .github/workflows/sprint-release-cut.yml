@@ -228,7 +228,7 @@ jobs:
             sleep 6
             run_id=$(gh run list --workflow publish.yml --branch "$BRANCH" --event workflow_dispatch \
               --limit 20 --json databaseId,displayTitle \
-              --jq "map(select(.displayTitle | endswith(\" $REQUEST_ID\"))) | .[0].databaseId // empty")
+              --jq "map(select(.displayTitle == \"Publish preview from $BRANCH $REQUEST_ID\")) | .[0].databaseId // empty")
             [ -n "$run_id" ] && break
           done
           if [ -z "$run_id" ]; then
