@@ -33,12 +33,11 @@ on:
         required: false
         default: ""
 
-# One publish per channel and branch at a time; never cancel one in flight. The
-# branch is in the key because a newer run in a group cancels the one queued
-# behind it: keyed by channel alone, a push to main would cancel the preview the
-# sprint cut queued on a release branch.
+# One publish per channel at a time, across branches, since the dist-tag is what
+# they share; never cancel one in flight. `dev` is main-only and the sprint cut
+# dispatches only preview, so a push to main never queues behind the cut's run.
 concurrency:
-  group: publish-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.channel || (github.ref == 'refs/heads/main' && 'dev' || 'preview') }}-${{ github.ref }}
+  group: publish-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.channel || (github.ref == 'refs/heads/main' && 'dev' || 'preview') }}
   cancel-in-progress: false
 
 permissions:
@@ -149,7 +148,7 @@ jobs:
         run: |
           set -euo pipefail
           if ! TAGS=$(npm view @uipath/skills-library dist-tags --json --registry=https://registry.npmjs.org/ 2>"$RUNNER_TEMP/npm-view.err"); then
-            if grep -q E404 "$RUNNER_TEMP/npm-view.err"; then
+            if grep -qE '^npm (error|ERR!) code E404$' "$RUNNER_TEMP/npm-view.err"; then
               TAGS='{}'
             else
               cat "$RUNNER_TEMP/npm-view.err"
