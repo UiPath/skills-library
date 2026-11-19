@@ -8,7 +8,7 @@
       "name": "uipath-library",
       "source": "./",
       "description": "Community-contributed skills and multi-product recipes for UiPath coding agents, reviewed and approved by UiPath.",
-      "version": "1.208.0",
+      "version": "1.207.0",
       "author": {
         "name": "UiPath community"
       },
