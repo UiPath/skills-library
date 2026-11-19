@@ -1,15 +1,42 @@
 {
-  "name": "uipath-skills-library",
-  "version": "0.1.0",
-  "private": true,
+  "name": "@uipath/skills-library",
+  "version": "1.208.0",
   "description": "Community-contributed skills and multi-product recipes for UiPath coding agents.",
+  "author": {
+    "name": "UiPath community"
+  },
   "license": "MIT",
+  "homepage": "https://github.com/UiPath/skills-library",
   "repository": {
     "type": "git",
     "url": "https://github.com/UiPath/skills-library.git"
   },
+  "keywords": [
+    "uipath",
+    "automation",
+    "skills",
+    "recipes",
+    "community",
+    "claude-code",
+    "agent"
+  ],
+  "files": [
+    "skills",
+    "assets",
+    "schemas/recipe.schema.json",
+    ".claude-plugin",
+    ".cursor-plugin",
+    ".codex-plugin",
+    ".agents/plugins",
+    "gemini-extension.json",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "validate": "node scripts/validate-skills.mjs",
-    "test": "node --test scripts/validate-skills.test.mjs scripts/steward-command.test.mjs"
+    "test": "node --test scripts/validate-skills.test.mjs scripts/steward-command.test.mjs scripts/sync-version.test.mjs",
+    "version:sync": "node scripts/sync-version.mjs",
+    "version:check": "node scripts/sync-version.mjs --check",
+    "content:check": "python3 scripts/check-sensitive-content.py"
   }
 }

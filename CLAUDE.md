@@ -10,7 +10,9 @@ This repo holds community-contributed skills for UiPath. Read [CONTRIBUTING.md](
 - `assets/core-skill-names.json` — names taken by the core repo, [UiPath/skills](https://github.com/UiPath/skills).
 - `.github/stewards.json`, `scripts/steward-command.mjs`, `docs/steward-guide.md` — who may approve, the `/approve` and `/reject` commands, and the steward process.
 - `archived/` — skills removed from the install path. Never install from here.
-- `.claude-plugin/`, `.cursor-plugin/`, `.codex-plugin/`, `.agents/plugins/`, `gemini-extension.json` — per-agent plugin manifests. All carry the same name (`uipath-library`) and the `package.json` version; change them together.
+- `.claude-plugin/`, `.cursor-plugin/`, `.codex-plugin/`, `.agents/plugins/`, `gemini-extension.json` — per-agent plugin manifests. All carry the same name (`uipath-library`) and the `package.json` version. Bump `package.json` only, then run `npm run version:sync`.
+- `scripts/check-sensitive-content.py` — the customer content scan, copied from the core repo. Keep the detectors in step with its copy there.
+- `.github/workflows/publish.yml`, `.github/workflows/sprint-release-cut.yml`, `scripts/sync-version.mjs`, `docs/release.md` — npm publishing of `@uipath/skills-library` and the release cycle, which follows [UiPath/skills](https://github.com/UiPath/skills): same version line, same biweekly cut.
 
 ## Rules
 
@@ -20,4 +22,4 @@ This repo holds community-contributed skills for UiPath. Read [CONTRIBUTING.md](
 - `SKILL.md` is tool-agnostic markdown. No tool names or slash commands that exist in only one coding agent.
 - No secrets, tenant identifiers, customer names or real sample data. Use `<PLACEHOLDER>` values.
 - Every `SKILL.md` body carries the line `UiPath-approved community skill. Maintained by its author.`
-- Run `npm run validate` before committing.
+- Run `npm run validate` and `npm run content:check` before committing.

@@ -21,5 +21,20 @@ jobs:
           node-version: 20
       - name: Validator tests
         run: npm test
+      # Same command as the guard in publish.yml, so drift fails here, before merge,
+      # instead of silently blocking every publish after it.
+      - name: Plugin manifests match package.json
+        run: npm run version:check
       - name: Validate every skill folder
         run: npm run validate
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Content scanner tests
+        run: |
+          pip install pytest==8.3.5
+          pytest -q scripts/test_check_sensitive_content.py
+      # The publish job runs the same scan on the packed tarball and blocks on any
+      # finding, so catch it here, on the pull request that adds it.
+      - name: Scan shipped content for customer-blocked data
+        run: npm run content:check

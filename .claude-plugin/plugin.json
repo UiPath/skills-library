@@ -1,6 +1,6 @@
 {
   "name": "uipath-library",
-  "version": "0.1.0",
+  "version": "1.208.0",
   "description": "Community-contributed skills and multi-product recipes for UiPath coding agents, reviewed and approved by UiPath.",
   "author": {
     "name": "UiPath community"
@@ -8,6 +8,12 @@
   "license": "MIT",
   "homepage": "https://github.com/UiPath/skills-library",
   "repository": "https://github.com/UiPath/skills-library",
-  "keywords": ["uipath", "automation", "skills", "recipes", "community"],
+  "keywords": [
+    "uipath",
+    "automation",
+    "skills",
+    "recipes",
+    "community"
+  ],
   "skills": "./skills/"
 }

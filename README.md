@@ -41,6 +41,12 @@ codex plugin marketplace add UiPath/skills-library --ref main
 codex plugin add uipath-library@uipath-library-marketplace
 ```
 
+**npm**, for tools that install skills from a package:
+
+```bash
+npm install @uipath/skills-library
+```
+
 | Agent | What the repo ships |
 |-------|---------------------|
 | Claude Code | `.claude-plugin/plugin.json`, `.claude-plugin/marketplace.json` |

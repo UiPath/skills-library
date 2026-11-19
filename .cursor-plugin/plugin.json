@@ -1,7 +1,7 @@
 {
   "name": "uipath-library",
   "displayName": "UiPath Skills Library",
-  "version": "0.1.0",
+  "version": "1.208.0",
   "description": "UiPath-approved community skills and multi-product recipes for building UiPath automations from Cursor.",
   "author": {
     "name": "UiPath community"
@@ -9,6 +9,12 @@
   "homepage": "https://github.com/UiPath/skills-library",
   "repository": "https://github.com/UiPath/skills-library",
   "license": "MIT",
-  "keywords": ["uipath", "automation", "skills", "recipes", "community"],
+  "keywords": [
+    "uipath",
+    "automation",
+    "skills",
+    "recipes",
+    "community"
+  ],
   "logo": "assets/uipath-icon.png"
 }

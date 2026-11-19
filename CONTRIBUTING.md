@@ -38,7 +38,7 @@ Does not belong here: changes to a core skill (names starting with `uipath-`). O
 ## Rules for skill content
 
 - **Build on the core skills.** Name the core skill that does a step (`uipath-maestro-flow`, `uipath-rpa`). Do not copy its content and do not link into another skill's folder.
-- **No real data.** No secrets, tenant names, folder keys, connection IDs or customer names. Use placeholders such as `<FOLDER_NAME>`.
+- **No real data.** No secrets, tenant names, folder keys, connection IDs or customer names. Use placeholders such as `<FOLDER_NAME>`. Customers scan the published package and reject it on anything shaped like a card number, SSN, phone number, street address, card expiry date or token, so use letter-only placeholders there too (`<PHONE_NUMBER>`, `<EXPIRATION_DATE>`, `NNN-NN-NNNN`) and pass secrets as `env.<NAME>`. `npm run content:check` finds them.
 - **Tool-agnostic.** Skills run in Claude Code, Cursor, Codex, Copilot and Gemini. Do not rely on tool names or slash commands from one of them.
 - **Say what fails.** The known failures you hit on a real project are the most useful part.
 

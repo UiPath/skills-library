@@ -9,3 +9,5 @@ package-lock.json
 .worktrees/
 .local/
 tmp/
+__pycache__/
+.pytest_cache/
