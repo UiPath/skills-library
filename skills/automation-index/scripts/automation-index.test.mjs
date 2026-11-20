@@ -1,0 +1,990 @@
+// Regression tests for automation-index.mjs, built from synthetic packages only.
+// Run: node --test scripts/automation-index.test.mjs
+// On Node 22.5-22.12 node:sqlite needs a flag: node --experimental-sqlite --test scripts/automation-index.test.mjs
+// Set AUTOMATION_INDEX_SCRIPT to test another copy of the indexer.
+
+import { test, before, describe } from "node:test";
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import zlib from "node:zlib";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { DatabaseSync } from "node:sqlite";
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const SCRIPT = process.env.AUTOMATION_INDEX_SCRIPT || path.join(HERE, "automation-index.mjs");
+const SECRET = "Sup3rS3cretValue";
+
+const NS = 'xmlns="http://schemas.microsoft.com/netfx/2009/xaml/activities" ' +
+  'xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" ' +
+  'xmlns:sap2010="http://schemas.microsoft.com/netfx/2010/xaml/activities/presentation" ' +
+  'xmlns:ui="http://schemas.uipath.com/workflow/activities" ' +
+  'xmlns:uix="http://schemas.uipath.com/workflow/activities/uix"';
+
+const MAIN = `<Activity x:Class="Main" ${NS}>
+  <Sequence sap2010:WorkflowViewState.IdRef="Sequence_1">
+    <ui:InvokeWorkflowFile DisplayName="Add item" WorkflowFileName="Framework\\Sub.xaml" sap2010:WorkflowViewState.IdRef="InvokeWorkflowFile_1">
+      <ui:InvokeWorkflowFile.Arguments>
+        <InArgument x:TypeArguments="x:String" x:Key="in_Queue">[Config("QueueKey").ToString]</InArgument>
+      </ui:InvokeWorkflowFile.Arguments>
+    </ui:InvokeWorkflowFile>
+    <ui:GetRobotCredential AssetName="Cred_Portal" DisplayName="Get portal login" sap2010:WorkflowViewState.IdRef="GetRobotCredential_1" />
+    <uix:NApplicationCard DisplayName="Use Portal" sap2010:WorkflowViewState.IdRef="NApplicationCard_1">
+      <uix:NApplicationCard.TargetApp>
+        <uix:TargetApp BrowserType="Edge" Url="https://portal.example.com/login" Title="Portal" />
+      </uix:NApplicationCard.TargetApp>
+    </uix:NApplicationCard>
+    <uix:NClick DisplayName="Click submit" sap2010:WorkflowViewState.IdRef="NClick_1">
+      <uix:NClick.Target>
+        <uix:TargetAnchorable FullSelectorArgument="&lt;html app='msedge.exe' title='Portal' url='https://portal.example.com/*' /&gt;&lt;webctrl id='submit' /&gt;" />
+      </uix:NClick.Target>
+    </uix:NClick>
+    <uix:NClick DisplayName="Click desktop" sap2010:WorkflowViewState.IdRef="NClick_2" >
+      <uix:NClick.Target>
+        <uix:TargetAnchorable ScopeSelectorArgument="&lt;wnd app='legacyerp.exe' title='ERP' /&gt;" />
+      </uix:NClick.Target>
+    </uix:NClick>
+    <ui:HttpClient DisplayName="Call API" EndPoint="https://api.example.org/v1/orders" Method="GET" sap2010:WorkflowViewState.IdRef="HttpClient_1" />
+    <ui:DatabaseConnect DisplayName="Connect" ProviderName="System.Data.SqlClient" ConnectionString="Server=db01.example.net;Database=Orders;User Id=svc;Password=${SECRET};" sap2010:WorkflowViewState.IdRef="DatabaseConnect_1" />
+    <ui:InvokeWorkflowFile DisplayName="Dynamic" WorkflowFileName="[in_Name]" sap2010:WorkflowViewState.IdRef="InvokeWorkflowFile_2" />
+  </Sequence>
+</Activity>`;
+
+const SUB = `<Activity x:Class="Sub" ${NS}>
+  <Sequence sap2010:WorkflowViewState.IdRef="Sequence_2">
+    <ui:AddQueueItem DisplayName="Add queue item" QueueName="[in_Queue]" sap2010:WorkflowViewState.IdRef="AddQueueItem_1" />
+  </Sequence>
+</Activity>`;
+
+const DEAD = `<Activity x:Class="Dead" ${NS}>
+  <Sequence sap2010:WorkflowViewState.IdRef="Sequence_3">
+    <ui:GetRobotAsset AssetName="Never_Used_Asset" sap2010:WorkflowViewState.IdRef="GetRobotAsset_9" />
+  </Sequence>
+</Activity>`;
+
+const PROJECT = JSON.stringify({
+  name: "Synthetic.Process", main: "Main.xaml", targetFramework: "Windows", expressionLanguage: "VisualBasic",
+  studioVersion: "25.10.0", dependencies: { "UiPath.System.Activities": "[25.10.0]", "Shared.Library": "[1.2.0]" },
+  designOptions: { outputType: "Process" },
+});
+
+const BINDINGS = JSON.stringify({ version: "2.0", resources: [{ resource: "asset", key: "Shared.Bound_Asset",
+  value: { name: { defaultValue: "Bound_Asset" }, folderPath: { defaultValue: "Shared" } }, metadata: { ActivityName: "Get bound asset" } }] });
+
+const APPMETA = JSON.stringify({ Version: "1.0", Metadata: [{ ApplicationType: "WindowsApplication",
+  ExecutablePath: { Value: "legacyerp.exe", IsExpression: false }, Url: null }] });
+
+const SIMPLE = `<Activity x:Class="Main" ${NS}>
+  <ui:GetRobotAsset AssetName="ASSET_NAME" sap2010:WorkflowViewState.IdRef="GetRobotAsset_1" />
+</Activity>`;
+
+/** Minimal zip writer: [[name, Buffer|string], ...] -> Buffer (deflate). */
+export function zip(entries) {
+  const locals = [];
+  const central = [];
+  let offset = 0;
+  for (const [name, content] of entries) {
+    const data = Buffer.isBuffer(content) ? content : Buffer.from(content, "utf8");
+    const comp = zlib.deflateRawSync(data);
+    const nameBuf = Buffer.from(name, "utf8");
+    const crc = zlib.crc32(data);
+    const lh = Buffer.alloc(30);
+    lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x800, 6); lh.writeUInt16LE(8, 8);
+    lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(comp.length, 18); lh.writeUInt32LE(data.length, 22); lh.writeUInt16LE(nameBuf.length, 26);
+    const ch = Buffer.alloc(46);
+    ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0x800, 8); ch.writeUInt16LE(8, 10);
+    ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(comp.length, 20); ch.writeUInt32LE(data.length, 24); ch.writeUInt16LE(nameBuf.length, 28);
+    ch.writeUInt32LE(offset, 42);
+    locals.push(lh, nameBuf, comp);
+    central.push(ch, nameBuf);
+    offset += 30 + nameBuf.length + comp.length;
+  }
+  const cd = Buffer.concat(central);
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(entries.length, 8); end.writeUInt16LE(entries.length, 10);
+  end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...locals, cd, end]);
+}
+
+export function xlsx(sheets) {
+  const shared = [];
+  const idx = new Map();
+  const sid = (v) => {
+    if (!idx.has(v)) { idx.set(v, shared.length); shared.push(v); }
+    return idx.get(v);
+  };
+  const files = [];
+  const wb = [];
+  const rels = [];
+  Object.entries(sheets).forEach(([name, rows], i) => {
+    const n = i + 1;
+    wb.push(`<sheet name="${name}" sheetId="${n}" r:id="rId${n}"/>`);
+    rels.push(`<Relationship Id="rId${n}" Target="worksheets/sheet${n}.xml" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"/>`);
+    const body = rows.map((row, r) => `<row r="${r + 1}">` + row.map((v, c) => `<c r="${String.fromCharCode(65 + c)}${r + 1}" t="s"><v>${sid(v)}</v></c>`).join("") + "</row>").join("");
+    files.push([`xl/worksheets/sheet${n}.xml`, `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>${body}</sheetData></worksheet>`]);
+  });
+  files.push(["xl/workbook.xml", '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>' + wb.join("") + "</sheets></workbook>"]);
+  files.push(["xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + rels.join("") + "</Relationships>"]);
+  files.push(["xl/sharedStrings.xml", '<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' + shared.map((s) => `<si><t>${s}</t></si>`).join("") + "</sst>"]);
+  return zip(files);
+}
+
+export function nupkg(file, pid, ver, files, dlls = {}) {
+  const entries = [[`${pid}.nuspec`, `<package><metadata><id>${pid}</id><version>${ver}</version></metadata></package>`]];
+  for (const [rel, data] of Object.entries(files)) entries.push(["content/" + rel, data]);
+  for (const [rel, data] of Object.entries(dlls)) entries.push([rel, data]);
+  fs.writeFileSync(file, zip(entries));
+}
+
+export function run(index, ...args) {
+  return spawnSync(process.execPath, [SCRIPT, "--index-dir", index, ...args], { encoding: "utf8" });
+}
+
+function write(p, text) {
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, text);
+}
+
+const openDb = (index) => new DatabaseSync(path.join(index, "index.db"));
+
+describe("extraction from a synthetic package", () => {
+  let tmp, index, db;
+  before(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-test-"));
+    index = path.join(tmp, "index");
+    const supplied = path.join(tmp, "supplied");
+    fs.mkdirSync(supplied);
+    const config = xlsx({
+      Settings: [["Name", "Value"], ["QueueKey", "Q_Invoices"], ["ApiPassword", SECRET], ["PortalUrl", "https://portal.example.com"],
+        ["ReportDb", `Server=rpt.example.net;Database=Rpt;Password=${SECRET}`]],
+      Assets: [["Name", "Asset"], ["OrchUrl", "Url_Asset"]],
+    });
+    nupkg(path.join(supplied, "Synthetic.Process.1.0.0.nupkg"), "Synthetic.Process", "1.0.0", {
+      "project.json": PROJECT, "Main.xaml": MAIN, "Framework/Sub.xaml": SUB, "Dead.xaml": DEAD,
+      "Data/Config.xlsx": config, "bindings_v2.json": BINDINGS, "applicationsMetadata.json": APPMETA,
+    });
+    const u16 = (s) => Buffer.from(s, "utf16le");
+    const dll = Buffer.concat([u16("https://compiled.example.com/api"), Buffer.alloc(2), u16("/api/orders/submit"), Buffer.alloc(2),
+      u16("Compiled_Process.Framework.InitAllSettings")]);
+    nupkg(path.join(supplied, "Compiled.Process.2.0.0.nupkg"), "Compiled.Process", "2.0.0", {
+      "project.json": JSON.stringify({ name: "Compiled.Process", main: "Main.xaml", targetFramework: "Portable" }), "bindings_v2.json": BINDINGS,
+    }, { "lib/net8.0/Compiled.Process.dll": dll });
+    let r = run(index, "extract", "--nupkg", supplied);
+    assert.equal(r.status, 0, r.stderr);
+    r = run(index, "review");
+    assert.equal(r.status, 0, r.stderr);
+    db = openDb(index);
+  });
+
+  const edges = (kind, pkg = "Synthetic.Process") =>
+    db.prepare("SELECT value, normalized, extractor, confidence, detail FROM edge WHERE package_id=? AND kind=?").all(pkg, kind);
+  const norms = (kind, pkg) => new Set(edges(kind, pkg).map((r) => r.normalized));
+
+  test("applications from selectors, TargetApp and Studio metadata", () => {
+    assert.ok(norms("uses_application").has("msedge.exe"));
+    assert.ok(norms("uses_application").has("legacyerp.exe"));
+    const ex = new Set(edges("uses_application").filter((r) => r.normalized === "legacyerp.exe").map((r) => r.extractor));
+    assert.ok(ex.has("studio_applications_metadata"));
+    assert.ok(ex.has("xaml:selector"));
+  });
+
+  test("URLs are normalized to hosts", () => {
+    assert.ok(norms("targets_url").has("portal.example.com"));
+    assert.ok(norms("calls_api").has("api.example.org"));
+  });
+
+  test("static credential and bound asset", () => {
+    assert.ok(norms("reads_credential").has("cred_portal"));
+    assert.ok(norms("reads_asset").has("bound_asset"));
+  });
+
+  test("Config Assets sheet values are read as asset names", () => {
+    const rows = edges("reads_asset").filter((r) => r.normalized === "url_asset");
+    assert.equal(rows[0]?.extractor, "config_assets_sheet");
+  });
+
+  test("queue traced through argument and Config", () => {
+    const rows = edges("uses_queue").filter((r) => r.normalized === "q_invoices");
+    assert.ok(rows.length, JSON.stringify(edges("uses_queue")));
+    assert.match(rows[0].extractor, /trace/);
+    assert.match(rows[0].detail, /Config 'QueueKey'/);
+  });
+
+  test("database target without credentials", () => {
+    assert.ok(norms("uses_database").has("db01.example.net/orders"));
+  });
+
+  test("secrets are never stored in clear", () => {
+    for (const { name: table } of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+      for (const { name: col } of db.prepare(`PRAGMA table_info(${table})`).all()) {
+        const hit = db.prepare(`SELECT count(*) n FROM ${table} WHERE CAST(${col} AS TEXT) LIKE ?`).get(`%${SECRET}%`).n;
+        assert.equal(hit, 0, `secret found in ${table}.${col}`);
+      }
+    }
+  });
+
+  test("hard-coded secrets are findings", () => {
+    const details = edges("hardcoded_secret").map((r) => r.detail);
+    assert.ok(details.some((d) => d.includes("connection string")), details.join("|"));
+    assert.ok(details.some((d) => d.includes("ApiPassword")), details.join("|"));
+    assert.ok(db.prepare("SELECT count(*) n FROM finding WHERE rule='AI-SEC-001'").get().n >= 2);
+  });
+
+  test("reachability", () => {
+    const rows = Object.fromEntries(db.prepare("SELECT path, reachable FROM workflow WHERE package_id='Synthetic.Process'").all().map((r) => [r.path, r.reachable]));
+    assert.equal(rows["Main.xaml"], 1);
+    assert.equal(rows["Framework/Sub.xaml"], 1);
+    assert.equal(rows["Dead.xaml"], null); // Main has a dynamic invoke: unknown, not dead
+  });
+
+  test("every edge has provenance", () => {
+    assert.equal(db.prepare("SELECT count(*) n FROM edge WHERE file IS NULL OR extractor IS NULL OR confidence IS NULL").get().n, 0);
+  });
+
+  test("compiled package is marked and low confidence", () => {
+    assert.equal(db.prepare("SELECT status FROM coverage WHERE package_id='Compiled.Process' AND stage='extract'").get().status, "compiled_only");
+    assert.deepEqual([...new Set(edges("calls_api", "Compiled.Process").map((r) => r.confidence))], ["low"]);
+    assert.ok(norms("reads_asset", "Compiled.Process").has("bound_asset"));
+    assert.ok(db.prepare("SELECT count(*) n FROM workflow WHERE package_id='Compiled.Process' AND kind='compiled'").get().n > 0);
+  });
+
+  test("query is read-only", () => {
+    const edgesBefore = db.prepare("SELECT count(*) n FROM edge").get().n;
+    const stray = path.join(tmp, "vacuum-copy.db");
+    // Layer 1: statement filter.
+    for (const sql of ["DELETE FROM edge", "SELECT 1; DELETE FROM edge", `VACUUM INTO '${stray}'`, `ATTACH '${stray}' AS x`,
+      "PRAGMA query_only = OFF", "DROP TABLE edge"]) {
+      const r = run(index, "query", sql);
+      assert.notEqual(r.status, 0, sql);
+      assert.match(r.stderr, /read-only|one statement/, sql);
+    }
+    // Layer 2: SQLite itself, for a write that passes the filter.
+    const r = run(index, "query", "WITH x AS (SELECT 1) INSERT INTO meta VALUES ('k', 'v')");
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr.replace(/\s/g, "").toLowerCase(), /readonly/);
+    assert.equal(db.prepare("SELECT count(*) n FROM edge").get().n, edgesBefore);
+    assert.equal(db.prepare("SELECT count(*) n FROM meta WHERE key='k'").get().n, 0);
+    assert.ok(!fs.existsSync(stray));
+    // Reads still work, including ';' inside strings and comments.
+    const ok = run(index, "query", "/* c */ SELECT ';' AS s, count(*) FROM edge -- x; y", "--format", "json");
+    assert.equal(ok.status, 0, ok.stderr);
+    assert.equal(JSON.parse(ok.stdout)[0].s, ";");
+  });
+
+  test("restrictions", () => {
+    const pol = path.join(tmp, "restrict.json");
+    fs.writeFileSync(pol, JSON.stringify({ applications: { allow: ["msedge.exe"] }, urls: { deny: ["*.example.org"] } }));
+    const r = run(index, "review", "--restrictions", pol);
+    assert.equal(r.status, 0, r.stderr);
+    const subjects = new Set(openDb(index).prepare("SELECT subject FROM finding WHERE rule='AI-GOV-001'").all().map((x) => x.subject));
+    assert.ok(subjects.has("legacyerp.exe"));
+    assert.ok(subjects.has("api.example.org"));
+    assert.ok(!subjects.has("msedge.exe"));
+  });
+
+  test("cards", () => {
+    const r = run(index, "cards");
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(fs.readFileSync(path.join(index, "INDEX.md"), "utf8"), /Synthetic\.Process/);
+  });
+
+  test("helpers", async () => {
+    const m = await import(pathToFileURL(SCRIPT).href);
+    assert.ok(!m.scrub("Server=a;Password=pw123;").includes("pw123"));
+    assert.ok(!m.scrub("https://user:pw123@host/x").includes("pw123"));
+    assert.equal(m.resolveVersion("[1.2.3]"), "1.2.3");
+    assert.equal(m.resolveVersion("[1.0, 2.0)"), null);
+  });
+});
+
+describe("layouts: one project, a repo of many, nested solutions", () => {
+  let tmp, index, db;
+  before(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-layout-"));
+    const repo = path.join(tmp, "repo");
+    const project = (rel, name, asset, deps = {}) => {
+      write(path.join(repo, rel, "project.json"), JSON.stringify({ name, main: "Main.xaml", targetFramework: "Windows", dependencies: deps }));
+      write(path.join(repo, rel, "Main.xaml"), SIMPLE.replace("ASSET_NAME", asset));
+    };
+    write(path.join(repo, "SolutionA", "SolutionA.uipx"), "{}");
+    project("SolutionA/Dispatcher", "Dispatcher", "A_Dispatcher", { "Shared.Library": "[1.0.0]" });
+    project("SolutionA/Performer", "Performer", "A_Performer");
+    write(path.join(repo, "nested", "deeper", "SolutionB", "SolutionB.uipx"), "{}");
+    project("nested/deeper/SolutionB/copy1", "Duplicate", "Dup_One");
+    project("nested/deeper/SolutionB/copy2", "Duplicate", "Dup_Two");
+    project("outer", "Outer", "Outer_Asset");
+    project("outer/inner", "Inner", "Inner_Asset");
+    write(path.join(repo, "libs", "Shared.Library", "project.json"), JSON.stringify({ name: "Shared.Library", main: "Login.xaml", targetFramework: "Windows", designOptions: { outputType: "Library" } }));
+    write(path.join(repo, "libs", "Shared.Library", "Login.xaml"), `<Activity x:Class="Login" ${NS}>\n  <ui:GetRobotCredential AssetName="Lib_Credential" sap2010:WorkflowViewState.IdRef="GetRobotCredential_7" />\n</Activity>`);
+    write(path.join(repo, "agents", "Helper", "agent.json"), "{}");
+    write(path.join(repo, "agents", "Helper", "project.uiproj"), "{}");
+    index = path.join(tmp, "index");
+    const r = run(index, "extract", "--source", repo);
+    assert.equal(r.status, 0, r.stderr);
+    db = openDb(index);
+  });
+
+  test("every project indexed once", () => {
+    const names = db.prepare("SELECT package_id FROM package WHERE kind <> 'other' ORDER BY package_id").all().map((r) => r.package_id);
+    assert.deepEqual(names, ["Dispatcher", "Duplicate", "Duplicate", "Inner", "Outer", "Performer", "Shared.Library"]);
+  });
+
+  test("duplicate names kept apart", () => {
+    assert.equal(new Set(db.prepare("SELECT version FROM package WHERE package_id='Duplicate'").all().map((r) => r.version)).size, 2);
+    assert.deepEqual(new Set(db.prepare("SELECT normalized FROM edge WHERE package_id='Duplicate'").all().map((r) => r.normalized)), new Set(["dup_one", "dup_two"]));
+  });
+
+  test("nested project not counted in outer", () => {
+    assert.deepEqual(db.prepare("SELECT DISTINCT normalized FROM edge WHERE package_id='Outer'").all().map((r) => r.normalized), ["outer_asset"]);
+    assert.deepEqual(db.prepare("SELECT path FROM workflow WHERE package_id='Outer'").all().map((r) => r.path), ["Main.xaml"]);
+  });
+
+  test("solution recorded", () => {
+    const sol = Object.fromEntries(db.prepare("SELECT package_id, solution FROM package WHERE package_id IN ('Dispatcher','Outer')").all().map((r) => [r.package_id, r.solution]));
+    assert.match(sol.Dispatcher, /SolutionA$/);
+    assert.equal(sol.Outer, null);
+    const dup = [...new Set(db.prepare("SELECT solution FROM package WHERE package_id='Duplicate'").all().map((r) => r.solution))];
+    assert.equal(dup.length, 1);
+    assert.match(dup[0], /nested\/deeper\/SolutionB$/);
+  });
+
+  test("non-RPA project reported, not skipped", () => {
+    assert.equal(db.prepare("SELECT status FROM coverage WHERE package_id='Helper'").get().status, "unsupported");
+  });
+
+  test("library from source is inherited", () => {
+    const rows = db.prepare("SELECT normalized, via FROM v_edge_all WHERE root_package_id='Dispatcher'").all();
+    assert.ok(rows.some((r) => r.normalized === "lib_credential" && r.via.startsWith("Shared.Library@source")));
+  });
+
+  test("single nupkg file", () => {
+    const pkg = path.join(tmp, "One.Process.1.0.0.nupkg");
+    nupkg(pkg, "One.Process", "1.0.0", { "project.json": JSON.stringify({ name: "One.Process", main: "Main.xaml" }), "Main.xaml": SIMPLE.replace("ASSET_NAME", "One_Asset") });
+    const idx = path.join(tmp, "index-one");
+    const r = run(idx, "extract", "--nupkg", pkg);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(openDb(idx).prepare("SELECT package_id, version FROM package").all().map((x) => ({ ...x })), [{ package_id: "One.Process", version: "1.0.0" }]);
+  });
+
+  test("re-extract is incremental and stable", () => {
+    const before = db.prepare("SELECT count(*) n FROM edge").get().n;
+    const r = run(index, "extract", "--source", path.join(tmp, "repo"));
+    assert.equal(r.status, 0, r.stderr);
+    const db2 = openDb(index);
+    assert.equal(db2.prepare("SELECT count(*) n FROM edge").get().n, before);
+    assert.equal(db2.prepare("SELECT count(*) n FROM package").get().n, 8);
+  });
+});
+
+describe("hostile and broken input", () => {
+  let tmp, index, db, result;
+  before(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-hostile-"));
+    const pk = path.join(tmp, "pkgs");
+    fs.mkdirSync(pk);
+    const ok = SIMPLE.replace("ASSET_NAME", "Fine_Asset");
+    const pj = (n) => JSON.stringify({ name: n, main: "Main.xaml" });
+    const spec = (id) => [`${id}.nuspec`, `<package><metadata><id>${id}</id><version>1.0.0</version></metadata></package>`];
+    fs.writeFileSync(path.join(pk, "slip.nupkg"), zip([spec("Slip"), ["content/project.json", pj("Slip")], ["content/Main.xaml", ok],
+      ["content/../../../escaped.txt", "X"], ["content/..%2f..%2fescaped2.txt", "X"], ["/abs-escaped.txt", "X"], ["content/C:/escaped4.txt", "X"]]));
+    fs.writeFileSync(path.join(pk, "empty.nupkg"), Buffer.alloc(0));
+    fs.writeFileSync(path.join(pk, "notzip.nupkg"), "not a zip");
+    const bl = `<!DOCTYPE l [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">]><Activity ${NS}><ui:GetRobotAsset AssetName="&b;"/></Activity>`;
+    const deep = "<a>".repeat(100 * 1000) + "</a>".repeat(100 * 1000);
+    fs.writeFileSync(path.join(pk, "xml.nupkg"), zip([spec("Xml"), ["content/project.json", pj("Xml")], ["content/Main.xaml", ok],
+      ["content/laughs.xaml", bl], ["content/deep.xaml", deep], ["content/broken.xaml", "<Activity><a></Activity>"],
+      ["content/utf16.xaml", Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(`<Activity ${NS}><ui:GetRobotAsset AssetName="Wide_Asset"/></Activity>`, "utf16le")])]]));
+    const src = path.join(tmp, "src", "P1");
+    fs.mkdirSync(src, { recursive: true });
+    fs.writeFileSync(path.join(src, "project.json"), pj("P1"));
+    fs.writeFileSync(path.join(src, "Main.xaml"), ok);
+    fs.writeFileSync(path.join(src, "inside.txt"), "INSIDE");
+    fs.writeFileSync(path.join(tmp, "outside.txt"), "OUTSIDE_SECRET");
+    fs.symlinkSync(path.join(tmp, "outside.txt"), path.join(src, "leak.txt"));
+    fs.symlinkSync(path.join(src, "inside.txt"), path.join(src, "inner-link.txt"));
+    fs.symlinkSync(path.join(tmp, "src"), path.join(src, "loop"));
+    index = path.join(tmp, "index");
+    const t0 = Date.now();
+    result = run(index, "extract", "--nupkg", pk, "--source", path.join(tmp, "src"));
+    result.seconds = (Date.now() - t0) / 1000;
+    db = openDb(index);
+  });
+
+  test("the run survives and finishes quickly", () => {
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.seconds < 20, `took ${result.seconds}s`);
+  });
+
+  test("nothing escapes the index folder", () => {
+    for (const f of ["escaped.txt", "escaped2.txt", "abs-escaped.txt", "escaped4.txt"]) {
+      assert.ok(!fs.existsSync(path.join(tmp, f)) && !fs.existsSync(path.join(path.dirname(tmp), f)) && !fs.existsSync("/" + f), f);
+    }
+    const hits = [];
+    const walk = (d) => { for (const e of fs.readdirSync(d, { withFileTypes: true })) { const p = path.join(d, e.name); if (e.isDirectory()) walk(p); else if (/escaped/.test(e.name)) hits.push(p); } };
+    walk(index);
+    assert.deepEqual(hits, []);
+  });
+
+  test("symlinks never pull files from outside the project", () => {
+    const tree = fs.readdirSync(path.join(index, "src")).map((d) => path.join(index, "src", d)).find((d) => d.includes("P1"));
+    const files = fs.readdirSync(tree);
+    assert.ok(!files.includes("leak.txt"));
+    assert.ok(files.includes("inner-link.txt")); // a link that stays inside the project is fine
+    const grep = (d) => fs.readdirSync(d, { withFileTypes: true }).some((e) => { const p = path.join(d, e.name); return e.isDirectory() ? grep(p) : fs.readFileSync(p, "utf8").includes("OUTSIDE_SECRET"); });
+    assert.ok(!grep(index.replace(/index$/, "index/src")));
+  });
+
+  test("review rows keep their columns aligned (rules select NULL more than once)", () => {
+    const r = run(index, "review");
+    assert.equal(r.status, 0, r.stderr);
+    const f = openDb(index).prepare("SELECT package_id, version, subject, detail FROM finding WHERE rule='AI-COV-001' AND package_id='empty.nupkg'").get();
+    assert.equal(f.version, "?");
+    assert.equal(f.subject, "empty.nupkg@?");
+    assert.match(f.detail, /^parse_error: /);
+    // AI-RES-004 selects NULL, NULL, NULL, name, detail, NULL: the subject must be the asset name.
+    const w = openDb(index);
+    w.prepare("INSERT INTO orch_asset VALUES ('k1', 'f1', 'Shared', 'Unused_Asset_Name', 'Text', 'Global', 0, '')").run();
+    w.close();
+    const r2 = run(index, "review");
+    assert.equal(r2.status, 0, r2.stderr);
+    const g = openDb(index).prepare("SELECT package_id, version, subject, detail FROM finding WHERE rule='AI-RES-004'").get();
+    assert.equal(g.package_id, null);
+    assert.equal(g.version, null);
+    assert.equal(g.subject, "Unused_Asset_Name");
+    assert.match(g.detail, /^folder Shared; type Text/);
+  });
+
+  test("broken packages are recorded, not fatal", () => {
+    const st = Object.fromEntries(db.prepare("SELECT package_id, status FROM coverage WHERE stage='extract'").all().map((r) => [r.package_id, r.status]));
+    assert.equal(st["empty.nupkg"], "parse_error");
+    assert.equal(st["notzip.nupkg"], "parse_error");
+    assert.equal(st.Slip, "indexed");
+    assert.equal(st.Xml, "indexed");
+  });
+
+  test("entities are not expanded and broken XML is a parse error", () => {
+    const wf = Object.fromEntries(db.prepare("SELECT path, parse_error FROM workflow WHERE package_id='Xml'").all().map((r) => [r.path, r.parse_error]));
+    assert.match(wf["laughs.xaml"], /DTD|entity/i);
+    assert.match(wf["broken.xaml"], /mismatched/);
+    assert.equal(wf["deep.xaml"], null);
+    assert.equal(db.prepare("SELECT count(*) n FROM edge WHERE value LIKE 'aaaaaaaaaa%'").get().n, 0);
+    assert.equal(db.prepare("SELECT count(*) n FROM edge WHERE normalized='wide_asset'").get().n, 1);
+  });
+});
+
+describe("regressions found in review", () => {
+  const SEC = "Zq9SecretVal";
+  let tmp, db, m;
+  before(async () => {
+    m = await import(pathToFileURL(SCRIPT).href);
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-review-"));
+    const main = `<Activity ${NS}><Sequence sap2010:WorkflowViewState.IdRef="S1">
+ <ui:InvokeCode Code="Dim a = &quot;https://h.example.com/one&quot;&#xA;Dim b = &quot;https://h.example.com/two&quot;" sap2010:WorkflowViewState.IdRef="IC1"/>
+ <ui:InvokeWorkflowFile WorkflowFileName="[&quot;Sub.xaml?pass=${SEC}&quot;]" sap2010:WorkflowViewState.IdRef="IW1"/>
+ <ui:HttpClient EndPoint="https://api.example.com/x?client_secret=${SEC}&amp;pass=${SEC}&amp;sig=${SEC}" sap2010:WorkflowViewState.IdRef="H2"/>
+</Sequence></Activity>`;
+    const cfg = xlsx({ Settings: [["Name", "Value"], ["SAPPass", SEC], ["UserPass_Dev", SEC], ["DbPassphrase", SEC], ["Pin", SEC], ["PassportUrl", "https://p.example.com"]] });
+    const cs = `class C {\n var a = system.GetAsset("Asset_One");\n var b = system.GetAsset("Asset_One");\n}`;
+    nupkg(path.join(tmp, "p.nupkg"), "P", "1.0.0", { "project.json": JSON.stringify({ name: "P", main: "Main.xaml" }), "Main.xaml": main,
+      "Data/Config.xlsx": cfg, "Coded.cs": cs, "appconfig.json": JSON.stringify({ Pass: SEC }),
+      "bindings_v2.json": JSON.stringify({ resources: [{ resource: "asset", value: { name: { defaultValue: "B" } }, metadata: { ActivityName: `pwd=${SEC}` } }] }) });
+    const r = run(path.join(tmp, "ix"), "extract", "--nupkg", path.join(tmp, "p.nupkg"));
+    assert.equal(r.status, 0, r.stderr);
+    db = openDb(path.join(tmp, "ix"));
+  });
+
+  test("credential-like names and URL parameters are never stored in clear", () => {
+    for (const { name: t } of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+      for (const { name: c } of db.prepare(`PRAGMA table_info(${t})`).all()) {
+        assert.equal(db.prepare(`SELECT count(*) n FROM ${t} WHERE CAST(${c} AS TEXT) LIKE ?`).get(`%${SEC}%`).n, 0, `${t}.${c}`);
+      }
+    }
+    assert.equal(db.prepare("SELECT value FROM config_key WHERE name='PassportUrl'").get().value, "https://p.example.com"); // not a secret
+    assert.ok(m.scrub("a?pass=x1").includes("redacted"));
+    for (const t of ['Password="my secret value"', "{'password': 'two words here'}", "pwd=abc def;Server=x", 'Server=s;Password="p;q r";Database=d']) {
+      for (const w of ["secret", "value", "words", "def", "q r"]) assert.ok(!(m.scrub(t).includes(w) && t.includes(w)), `${t} -> ${m.scrub(t)}`);
+    }
+    assert.equal(m.scrub("pwd=abc def;Server=x"), "pwd=<redacted len=7>;Server=x");
+    assert.ok(!m.scrub("bypass=yes").includes("redacted"));
+  });
+
+  test("distinct values and per-line evidence are kept", () => {
+    assert.deepEqual(db.prepare("SELECT value FROM edge WHERE activity LIKE 'IC1%' AND kind='targets_url' ORDER BY value").all().map((r) => r.value),
+      ["https://h.example.com/one", "https://h.example.com/two"]);
+    assert.deepEqual(db.prepare("SELECT line FROM edge WHERE file='Coded.cs' AND kind='reads_asset' ORDER BY line").all().map((r) => r.line), [2, 3]);
+  });
+
+  test("nested namespace declarations stay linear", () => {
+    let s = "";
+    const n = 20 * 1000;
+    for (let i = 0; i < n; i++) s += `<p${i}:e xmlns:p${i}="urn:${i}">`;
+    for (let i = n - 1; i >= 0; i--) s += `</p${i}:e>`;
+    const t0 = Date.now();
+    const root = m.parseXml(Buffer.from(s));
+    assert.ok(Date.now() - t0 < 3000, `took ${Date.now() - t0} ms`);
+    assert.equal(root.ns, "urn:0");
+    assert.throws(() => m.parseXml(Buffer.from('<a xmlns:p="urn:x"><p:b/></a><!-- --><q:c/>')));
+    assert.throws(() => m.parseXml(Buffer.from('<a><p:b xmlns:p="urn:x"/><p:c/></a>')), /unbound prefix/); // scope ends with the element
+  });
+});
+
+describe("second review: findings reproduced as tests", () => {
+  const SEC = "DEMO_SECRET";
+  let tmp, m;
+  const extract = (index, ...args) => {
+    const r = run(index, "extract", ...args);
+    return r;
+  };
+  const proj = (dir, name, files, extra = {}) => {
+    write(path.join(dir, "project.json"), JSON.stringify({ name, main: "Main.xaml", ...extra }));
+    for (const [rel, txt] of Object.entries(files)) write(path.join(dir, rel), txt);
+  };
+  const act = (body) => `<Activity ${NS}>${body}</Activity>`;
+  before(async () => {
+    m = await import(pathToFileURL(SCRIPT).href);
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-r2-"));
+  });
+
+  test("F1 secrets in metadata, quoted values, encoded names and secret properties are redacted", () => {
+    const d = path.join(tmp, "f1");
+    fs.mkdirSync(d, { recursive: true });
+    nupkg(path.join(d, "p.nupkg"), "F1", "1.0.0", {
+      "project.json": JSON.stringify({ name: "F1", main: "Main.xaml", description: `Password="${SEC}"` }),
+      "Main.xaml": act(`<ui:HttpClient EndPoint="https://a.example.com/?%74oken=${SEC}" sap2010:WorkflowViewState.IdRef="H1"/>
+        <ui:SendMail Password="https://${SEC}.example.com/" sap2010:WorkflowViewState.IdRef="M1"/>`),
+      "bindings_v2.json": JSON.stringify({ resources: [{ resource: "asset", value: { name: { defaultValue: "B" } }, metadata: { Password: SEC, ActivityName: "x" } }] }),
+    });
+    const r = extract(path.join(d, "ix"), "--nupkg", path.join(d, "p.nupkg"));
+    assert.equal(r.status, 0, r.stderr);
+    const db = openDb(path.join(d, "ix"));
+    for (const { name: t } of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+      for (const { name: c } of db.prepare(`PRAGMA table_info(${t})`).all()) {
+        assert.equal(db.prepare(`SELECT count(*) n FROM ${t} WHERE CAST(${c} AS TEXT) LIKE ?`).get(`%${SEC}%`).n, 0, `${t}.${c}`);
+      }
+    }
+  });
+
+  test("F2 a symlinked folder inside the index never redirects writes outside it", () => {
+    const d = path.join(tmp, "f2");
+    const outside = path.join(d, "outside");
+    fs.mkdirSync(outside, { recursive: true });
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    fs.mkdirSync(path.join(d, "ix"), { recursive: true });
+    fs.symlinkSync(outside, path.join(d, "ix", "src"));
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    assert.deepEqual(fs.readdirSync(outside), []);
+  });
+
+  test("F3 the dependency closure has one row per reachable package, even with diamonds and cycles", () => {
+    const d = path.join(tmp, "f3");
+    const lib = (n, deps, asset) => proj(path.join(d, "repo", n), n, asset ? { "Main.xaml": SIMPLE.replace("ASSET_NAME", asset) } : {}, { dependencies: deps });
+    lib("A", { B: "[1.0.0]", C: "[1.0.0]" });
+    lib("B", { D: "[1.0.0]" });
+    lib("C", { D: "[1.0.0]" });
+    lib("D", {}, "D_Asset");
+    lib("X", { Y: "[1.0.0]" });
+    lib("Y", { X: "[1.0.0]" });
+    const r = extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    assert.equal(r.status, 0, r.stderr);
+    const db = openDb(path.join(d, "ix"));
+    assert.equal(db.prepare("SELECT count(*) n FROM v_edge_all WHERE root_package_id='A' AND normalized='d_asset'").get().n, 1);
+    assert.ok(db.prepare("SELECT count(*) n FROM dep_closure WHERE root_id='X'").get().n <= 2);
+  });
+
+  test("F4 size limits cover every archive read and spreadsheet dimensions", () => {
+    const d = path.join(tmp, "f4");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "big.nupkg"), zip([["Big.nuspec", Buffer.alloc(51 * 1024 * 1024, 0x20)], ["content/project.json", "{}"]]));
+    const wide = zip([["xl/workbook.xml", '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Settings" sheetId="1" r:id="rId1"/></sheets></workbook>'],
+      ["xl/_rels/workbook.xml.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Target="worksheets/sheet1.xml" Type="x"/></Relationships>'],
+      ["xl/worksheets/sheet1.xml", '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="ZZZZ1" t="inlineStr"><is><t>x</t></is></c></row></sheetData></worksheet>']]);
+    nupkg(path.join(d, "wide.nupkg"), "Wide", "1.0.0", { "project.json": JSON.stringify({ name: "Wide" }), "Data/Config.xlsx": wide });
+    const t0 = Date.now();
+    const r = extract(path.join(d, "ix"), "--nupkg", d);
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(Date.now() - t0 < 10000);
+    const db = openDb(path.join(d, "ix"));
+    assert.match(db.prepare("SELECT detail FROM coverage WHERE package_id='big.nupkg'").get().detail, /limit/i);
+    assert.notEqual(db.prepare("SELECT status FROM coverage WHERE package_id='Wide' AND stage='extract'").get().status, "parse_error");
+    assert.equal(db.prepare("SELECT count(*) n FROM coverage WHERE package_id='Wide' AND stage LIKE 'config:%'").get().n, 0);
+    assert.throws(() => m.readXlsx(Buffer.from("x")));
+  });
+
+  test("F5 a long single-line document parses in linear time", () => {
+    const s = "<r>" + "<a/>".repeat(400 * 1000) + "</r>";
+    const t0 = Date.now();
+    const root = m.parseXml(Buffer.from(s));
+    assert.ok(Date.now() - t0 < 2500, `took ${Date.now() - t0} ms`);
+    assert.equal(root.children.length, 400 * 1000);
+  });
+
+  test("F6 query accepts only read-only PRAGMAs", () => {
+    const d = path.join(tmp, "f6");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    for (const sql of ["PRAGMA wal_checkpoint(TRUNCATE)", "PRAGMA journal_mode", "PRAGMA optimize", "PRAGMA incremental_vacuum"]) {
+      const r = run(path.join(d, "ix"), "query", sql);
+      assert.notEqual(r.status, 0, sql);
+    }
+    assert.equal(run(path.join(d, "ix"), "query", "PRAGMA table_info(edge)").status, 0);
+  });
+
+  test("F8 renaming a source file re-indexes the project", () => {
+    const d = path.join(tmp, "f8");
+    const p = path.join(d, "repo", "P");
+    proj(p, "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A"), "Sub.xaml": SIMPLE.replace("ASSET_NAME", "B") });
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    fs.renameSync(path.join(p, "Sub.xaml"), path.join(p, "Renamed.xaml"));
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    const paths = openDb(path.join(d, "ix")).prepare("SELECT path FROM workflow ORDER BY path").all().map((r) => r.path);
+    assert.deepEqual(paths, ["Main.xaml", "Renamed.xaml"]);
+  });
+
+  test("F9 a changed package drops analyzer results and stale facts", () => {
+    const d = path.join(tmp, "f9");
+    const p = path.join(d, "repo", "P");
+    proj(p, "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    const ix = path.join(d, "ix");
+    extract(ix, "--source", path.join(d, "repo"));
+    const w = openDb(ix);
+    const ver = w.prepare("SELECT version FROM package WHERE package_id='P'").get().version;
+    w.prepare("INSERT INTO analyzer_run VALUES ('P', ?, 'ok', NULL, 1, 0, 0, 'x', 'now')").run(ver);
+    w.prepare("INSERT INTO analyzer_finding VALUES ('P', ?, 'Error', 'R', 'E', 'Main.xaml', '', '', 'old', '')").run(ver);
+    w.close();
+    write(path.join(p, "Main.xaml"), SIMPLE.replace("ASSET_NAME", "Changed"));
+    extract(ix, "--source", path.join(d, "repo"));
+    const db = openDb(ix);
+    assert.equal(db.prepare("SELECT count(*) n FROM analyzer_run").get().n, 0);
+    assert.equal(db.prepare("SELECT count(*) n FROM analyzer_finding").get().n, 0);
+    // replaced by a package without project.json: old facts go
+    const pk = path.join(d, "pk");
+    fs.mkdirSync(pk, { recursive: true });
+    nupkg(path.join(pk, "q.nupkg"), "Q", "1.0.0", { "project.json": JSON.stringify({ name: "Q", main: "Main.xaml" }), "Main.xaml": SIMPLE.replace("ASSET_NAME", "QA") });
+    extract(ix, "--nupkg", pk);
+    fs.writeFileSync(path.join(pk, "q.nupkg"), zip([["Q.nuspec", "<package><metadata><id>Q</id><version>1.0.0</version></metadata></package>"], ["content/flow.json", "{}"]]));
+    extract(ix, "--nupkg", pk);
+    assert.equal(openDb(ix).prepare("SELECT count(*) n FROM edge WHERE package_id='Q'").get().n, 0);
+  });
+
+  test("F10 an index inside the source tree is not read back as source", () => {
+    const d = path.join(tmp, "f10");
+    proj(path.join(d, "P"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    extract(path.join(d, "P", "automation-index"), "--source", path.join(d, "P"));
+    extract(path.join(d, "P", "automation-index"), "--source", path.join(d, "P"));
+    assert.equal(openDb(path.join(d, "P", "automation-index")).prepare("SELECT count(*) n FROM package").get().n, 1);
+  });
+
+  test("F11 folder names that sanitize alike keep separate source trees", () => {
+    const d = path.join(tmp, "f11");
+    proj(path.join(d, "repo", "a", "b"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "One") });
+    proj(path.join(d, "repo", "a_b"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "Two") });
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    assert.equal(fs.readdirSync(path.join(d, "ix", "src")).length, 2);
+  });
+
+  test("F12/F13 Config inside a larger expression and later assignments are not resolved", () => {
+    const d = path.join(tmp, "f12");
+    const cfg = xlsx({ Settings: [["Name", "Value"], ["QueueKey", "Base"]] });
+    proj(path.join(d, "repo", "P"), "P", {
+      "Main.xaml": act(`<Sequence sap2010:WorkflowViewState.IdRef="S1">
+        <ui:AddQueueItem QueueName="[Config(&quot;QueueKey&quot;) &amp; &quot;_Suffix&quot;]" sap2010:WorkflowViewState.IdRef="Q1"/>
+        <ui:AddQueueItem QueueName="[q]" sap2010:WorkflowViewState.IdRef="Q2"/>
+        <Assign sap2010:WorkflowViewState.IdRef="A1"><Assign.To><OutArgument x:TypeArguments="x:String">[q]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">Future</InArgument></Assign.Value></Assign>
+      </Sequence>`),
+    });
+    fs.writeFileSync(path.join(d, "repo", "P", "Config.xlsx"), cfg);
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    const rows = openDb(path.join(d, "ix")).prepare("SELECT normalized, detail FROM edge WHERE kind='uses_queue'").all();
+    const qs = rows.map((r) => r.normalized);
+    assert.ok(!qs.includes("base"), qs.join(","));
+    assert.ok(!qs.includes("future"), qs.join(","));
+    // kept as hints on the dynamic facts, not as values
+    assert.ok(rows.some((r) => /combines Config 'QueueKey' \(= 'Base'\)/.test(r.detail || "")), JSON.stringify(rows));
+    assert.ok(rows.some((r) => /possible value 'Future'/.test(r.detail || "")), JSON.stringify(rows));
+  });
+
+  test("F14/F15/F16 activity identity, parent-relative calls and reachability after parse errors", () => {
+    const d = path.join(tmp, "f14");
+    proj(path.join(d, "repo", "P"), "P", {
+      "Main.xaml": "<Activity><broken></Activity>",
+      "Child.xaml": SIMPLE.replace("ASSET_NAME", "C"),
+      "A/Sub/Caller.xaml": act(`<ui:InvokeWorkflowFile WorkflowFileName="..\\Common.xaml"/>\n<ui:AddQueueItem QueueName="Q"/>\n<ui:AddQueueItem QueueName="Q"/>`),
+      "A/Common.xaml": SIMPLE.replace("ASSET_NAME", "Common"),
+    });
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    const db = openDb(path.join(d, "ix"));
+    assert.equal(db.prepare("SELECT count(*) n FROM edge WHERE kind='uses_queue' AND file='A/Sub/Caller.xaml'").get().n, 2);
+    // Studio resolves WorkflowFileName from the project root (19,526 of 19,526 sub-folder invokes in real projects did):
+    // "..\\Common.xaml" leaves the project, so it is unresolved rather than guessed.
+    assert.equal(db.prepare("SELECT target_path FROM invocation WHERE from_path='A/Sub/Caller.xaml'").get().target_path, null);
+    assert.equal(db.prepare("SELECT reachable FROM workflow WHERE path='Child.xaml'").get().reachable, null);
+  });
+
+  test("F17/F18/F19 XML attribute safety, declarations and DTDs", () => {
+    const r = m.parseXml(Buffer.from('<r __proto__="text" a="1"/>'));
+    assert.equal(Object.getOwnPropertyDescriptor(r.attrs, "__proto__")?.value, "text");
+    assert.equal(m.parseXml(Buffer.from('<?xml version="1.0"\n encoding="utf-8"?>\n<r/>')).line, 3);
+    const latin = Buffer.concat([Buffer.from('<?xml version="1.0" encoding="ISO-8859-1"?><r>'), Buffer.from([0xc3, 0xa9]), Buffer.from("</r>")]);
+    assert.equal(m.parseXml(latin).text, "Ã©");
+    assert.throws(() => m.parseXml(Buffer.from('<!DOCTYPE r [<!ATTLIST r a CDATA "default">]><r/>')));
+  });
+
+  test("F20 zip entries with a wrong CRC are rejected", () => {
+    const z = zip([["x.txt", "GOOD"]]);
+    const cd = z.lastIndexOf(Buffer.from([0x50, 0x4b, 0x01, 0x02]));
+    z.writeUInt32LE(0, cd + 16);
+    z.writeUInt32LE(0, 14);
+    assert.throws(() => new m.Zip(z).read("x.txt"), /CRC/);
+  });
+
+  test("F21 resource rules respect the folder an activity names", () => {
+    const d = path.join(tmp, "f21");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": act('<ui:GetRobotAsset AssetName="A" FolderPath="Missing"/>') });
+    const ix = path.join(d, "ix");
+    extract(ix, "--source", path.join(d, "repo"));
+    const w = openDb(ix);
+    const pkg = w.prepare("SELECT package_id, version FROM package").get();
+    w.prepare("INSERT INTO process VALUES ('K1','P','f1','Shared',?,?,'Process','Windows',NULL,1,0,NULL,'[]',NULL,NULL)").run(pkg.package_id, pkg.version);
+    w.prepare("INSERT INTO orch_asset VALUES ('a1','f2','Elsewhere','A','Text','Global',0,'')").run();
+    w.close();
+    assert.equal(run(ix, "review").status, 0);
+    assert.equal(openDb(ix).prepare("SELECT count(*) n FROM finding WHERE rule='AI-RES-001' AND subject='A'").get().n, 1);
+  });
+
+  test("F22 file and package names are matched case-insensitively", () => {
+    const d = path.join(tmp, "f22");
+    fs.mkdirSync(d, { recursive: true });
+    fs.writeFileSync(path.join(d, "c.nupkg"), zip([["Case.nuspec", "<package><metadata><id>Case</id><version>1.0.0</version></metadata></package>"],
+      ["content/Project.JSON", JSON.stringify({ name: "Case", main: "Main.xaml", dependencies: { "shared.lib": "[1.0.0]" } })], ["content/Main.xaml", SIMPLE.replace("ASSET_NAME", "M")]]));
+    proj(path.join(d, "repo", "Shared.Lib"), "Shared.Lib", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "LibAsset") }, { designOptions: { outputType: "Library" } });
+    extract(path.join(d, "ix"), "--nupkg", path.join(d, "c.nupkg"), "--source", path.join(d, "repo"));
+    const db = openDb(path.join(d, "ix"));
+    assert.equal(db.prepare("SELECT status FROM coverage WHERE package_id='Case' AND stage='extract'").get()?.status, "indexed");
+    assert.equal(db.prepare("SELECT count(*) n FROM v_edge_all WHERE root_package_id='Case' AND normalized='libasset'").get().n, 1);
+  });
+
+  test("F23 a failed list call keeps the previous inventory", () => {
+    const d = path.join(tmp, "f23");
+    fs.mkdirSync(d, { recursive: true });
+    const fake = path.join(d, "fake-uip.mjs");
+    fs.writeFileSync(fake, `const a = process.argv.slice(2).join(" ");
+const ok = (Data, more = false) => console.log(JSON.stringify({ Result: "Success", Data, Pagination: { HasMore: more } }));
+if (a.startsWith("login status")) ok({ Status: "Logged in", Organization: "o", Tenant: "t" });
+else if (a.startsWith("or processes list")) { console.log(JSON.stringify({ Result: "Failure", Message: "simulated outage" })); }
+else ok([]);`);
+    const ix = path.join(d, "ix");
+    fs.mkdirSync(ix);
+    const w = new DatabaseSync(path.join(ix, "index.db"));
+    w.close();
+    run(ix, "status");
+    const w2 = openDb(ix);
+    w2.prepare("INSERT INTO process VALUES ('K1','Old','f','F','P','1',NULL,NULL,NULL,1,0,NULL,'[]',NULL,NULL)").run();
+    w2.close();
+    const r = run(ix, "crawl", "--uip", fake, "--skip-jobs", "--skip-libraries");
+    assert.equal(r.status, 0, r.stderr);
+    const db = openDb(ix);
+    assert.equal(db.prepare("SELECT count(*) n FROM process").get().n, 1);
+    assert.match(run(ix, "status").stdout, /simulated outage/);
+  });
+
+  test("F25 an unreadable project.json is reported as partial", () => {
+    const d = path.join(tmp, "f25");
+    write(path.join(d, "repo", "P", "project.json"), "{broken");
+    write(path.join(d, "repo", "P", "Main.xaml"), SIMPLE.replace("ASSET_NAME", "A"));
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    const row = openDb(path.join(d, "ix")).prepare("SELECT status, detail FROM coverage WHERE stage='extract'").get();
+    assert.equal(row.status, "partial");
+    assert.match(row.detail, /project\.json/);
+  });
+
+  test("F24 --limit stops an unbounded query on every Node version", () => {
+    const d = path.join(tmp, "f24");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    const r = spawnSync(process.execPath, [SCRIPT, "--index-dir", path.join(d, "ix"), "query",
+      "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT x FROM n", "--limit", "3", "--format", "json"], { encoding: "utf8", timeout: 20000 });
+    assert.equal(r.status, 0, r.stderr || String(r.error));
+    assert.deepEqual(JSON.parse(r.stdout).map((x) => x.x), [1, 2, 3]);
+  });
+
+  test("F26 JSON query output keeps duplicate column names apart", () => {
+    const d = path.join(tmp, "f26");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    extract(path.join(d, "ix"), "--source", path.join(d, "repo"));
+    const r = run(path.join(d, "ix"), "query", "SELECT 1 AS x, 2 AS x", "--format", "json");
+    assert.deepEqual(JSON.parse(r.stdout), [{ x: 1, "x:1": 2 }]);
+  });
+});
+
+describe("third review: findings reproduced as tests", () => {
+  const SEC = "DEMO_SECRET";
+  let tmp, m;
+  const proj = (dir, name, files, extra = {}) => {
+    write(path.join(dir, "project.json"), JSON.stringify({ name, main: "Main.xaml", ...extra }));
+    for (const [rel, txt] of Object.entries(files)) write(path.join(dir, rel), txt);
+  };
+  const act = (body) => `<Activity ${NS}>${body}</Activity>`;
+  const noSecret = (ix) => {
+    const db = openDb(ix);
+    for (const { name: t } of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
+      for (const { name: c } of db.prepare(`PRAGMA table_info(${t})`).all()) {
+        assert.equal(db.prepare(`SELECT count(*) n FROM ${t} WHERE CAST(${c} AS TEXT) LIKE ?`).get(`%${SEC}%`).n, 0, `${t}.${c}`);
+      }
+    }
+  };
+  before(async () => {
+    m = await import(pathToFileURL(SCRIPT).href);
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-r3-"));
+  });
+
+  test("R1 secrets in nested secret properties, escaped quotes and URL values are redacted", () => {
+    const d = path.join(tmp, "r1");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": act(`<ui:SendMail sap2010:WorkflowViewState.IdRef="M1"><ui:SendMail.Password><InArgument x:TypeArguments="x:String"><VisualBasicValue x:TypeArguments="x:String" ExpressionText="&quot;https://${SEC}.example.com/&quot;" /></InArgument></ui:SendMail.Password></ui:SendMail>
+      <ui:HttpClient EndPoint="https://api.example.com/x?token=alpha;${SEC}" sap2010:WorkflowViewState.IdRef="H1"/>`),
+      "bindings_v2.json": JSON.stringify({ resources: [{ resource: "asset", value: { name: { defaultValue: "B" } }, metadata: { nested: { Password: `ab"${SEC}` } } }] }) });
+    write(path.join(d, "repo", "P", "appconfig.json"), JSON.stringify({ Note: `{"Password":"ab\\"${SEC}"}` }));
+    assert.equal(run(path.join(d, "ix"), "extract", "--source", path.join(d, "repo")).status, 0);
+    noSecret(path.join(d, "ix"));
+    assert.ok(!m.scrub('{"nested":{"Password":"ab\\"' + SEC + '"}}').includes(SEC));
+    assert.ok(!m.scrub(`?token=alpha;${SEC}`).includes(SEC));
+    assert.equal(m.scrub("pwd=abc def;Server=x"), "pwd=<redacted len=7>;Server=x");
+  });
+
+  test("R2 a linked index.db is refused", () => {
+    const d = path.join(tmp, "r2");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    fs.mkdirSync(path.join(d, "ix"), { recursive: true });
+    const outside = path.join(d, "outside.db");
+    new DatabaseSync(outside).close();
+    const before = fs.statSync(outside).size;
+    fs.symlinkSync(outside, path.join(d, "ix", "index.db"));
+    const r = run(path.join(d, "ix"), "extract", "--source", path.join(d, "repo"));
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /link/i);
+    assert.equal(fs.statSync(outside).size, before);
+  });
+
+  test("R5 a failed folder listing keeps every per-folder inventory", () => {
+    const d = path.join(tmp, "r5");
+    fs.mkdirSync(d, { recursive: true });
+    const fake = path.join(d, "fake-uip.mjs");
+    fs.writeFileSync(fake, `const a = process.argv.slice(2).join(" ");
+const ok = (Data) => console.log(JSON.stringify({ Result: "Success", Data, Pagination: { HasMore: false } }));
+if (a.startsWith("login status")) ok({ Status: "Logged in" });
+else if (a.startsWith("or folders list")) console.log(JSON.stringify({ Result: "Failure", Message: "folders unavailable" }));
+else if (a.startsWith("or processes list")) ok([{ Key: "k1", Name: "Proc", FolderKey: "f-active", OrganizationUnitFullyQualifiedName: "Active", ProcessKey: "P", ProcessVersion: "1" }]);
+else ok([]);`);
+    const ix = path.join(d, "ix");
+    run(ix, "status");
+    const w = openDb(ix);
+    w.prepare("INSERT INTO folder VALUES ('f-res', 'ResourceOnly', 'Standard', NULL, 'folders list')").run();
+    w.prepare("INSERT INTO orch_asset VALUES ('a1', 'f-res', 'ResourceOnly', 'Kept_Asset', 'Text', 'Global', 0, '')").run();
+    w.close();
+    assert.equal(run(ix, "crawl", "--uip", fake, "--skip-jobs", "--skip-libraries").status, 0);
+    const db = openDb(ix);
+    assert.equal(db.prepare("SELECT count(*) n FROM orch_asset WHERE name='Kept_Asset'").get().n, 1);
+    assert.equal(db.prepare("SELECT value FROM meta WHERE key='inventory_asset_ok'").get().value, "0");
+  });
+
+  test("R6 a trailing comment does not break --limit", () => {
+    const d = path.join(tmp, "r6");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    run(path.join(d, "ix"), "extract", "--source", path.join(d, "repo"));
+    const r = spawnSync(process.execPath, [SCRIPT, "--index-dir", path.join(d, "ix"), "query",
+      "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n) SELECT x FROM n -- note", "--limit", "2", "--format", "json"], { encoding: "utf8", timeout: 20000 });
+    assert.equal(r.status, 0, r.stderr || String(r.error));
+    assert.deepEqual(JSON.parse(r.stdout).map((x) => x.x), [1, 2]);
+  });
+
+  test("R9/R10 a renamed or broken project keeps one identity and no stale findings", () => {
+    const d = path.join(tmp, "r9");
+    const p = path.join(d, "repo", "P");
+    proj(p, "Logical", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A") });
+    const ix = path.join(d, "ix");
+    run(ix, "extract", "--source", path.join(d, "repo"));
+    const w = openDb(ix);
+    const k = w.prepare("SELECT package_id, version FROM package").get();
+    w.prepare("INSERT INTO finding VALUES ('AI-WA-001','Warning',?,?,NULL,'old','old analyzer error',NULL,'t')").run(k.package_id, k.version);
+    w.close();
+    write(path.join(p, "project.json"), "{broken");
+    run(ix, "extract", "--source", path.join(d, "repo"));
+    const db = openDb(ix);
+    assert.equal(db.prepare("SELECT count(*) n FROM package").get().n, 1);
+    assert.equal(db.prepare("SELECT status FROM coverage WHERE stage='extract'").get().status, "partial");
+    assert.equal(db.prepare("SELECT count(*) n FROM finding WHERE detail='old analyzer error'").get().n, 0);
+  });
+
+  test("R7 folder names: aliases, relative paths, dynamic folders and traced values", () => {
+    const d = path.join(tmp, "r7");
+    proj(path.join(d, "repo", "P"), "P", { "Main.xaml": act(`<Sequence sap2010:WorkflowViewState.IdRef="S1">
+      <ui:GetRobotCredential AssetName="CredA" OrchestratorFolderPath="Elsewhere" sap2010:WorkflowViewState.IdRef="C1"/>
+      <ui:GetRobotAsset AssetName="Rel" FolderPath=".." sap2010:WorkflowViewState.IdRef="G1"/>
+      <ui:GetRobotAsset AssetName="Dyn" FolderPath="[f]" sap2010:WorkflowViewState.IdRef="G2"/>
+      <Assign sap2010:WorkflowViewState.IdRef="A1"><Assign.To><OutArgument x:TypeArguments="x:String">[q]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">Traced_Q</InArgument></Assign.Value></Assign>
+      <ui:AddQueueItem QueueName="[q]" FolderPath="Elsewhere" sap2010:WorkflowViewState.IdRef="Q1"/>
+    </Sequence>`) });
+    const ix = path.join(d, "ix");
+    run(ix, "extract", "--source", path.join(d, "repo"));
+    const w = openDb(ix);
+    const k = w.prepare("SELECT package_id, version FROM package").get();
+    w.prepare("INSERT INTO process VALUES ('K1','P','f-child','Shared/Child',?,?,'Process','Windows',NULL,1,0,NULL,'[]',NULL,NULL)").run(k.package_id, k.version);
+    for (const [key, fk, fp, name] of [["a1", "f-shared", "Shared", "Rel"], ["a2", "f-else", "Elsewhere", "Dyn"], ["a3", "f-else", "Elsewhere", "CredA"]]) {
+      w.prepare("INSERT INTO orch_asset VALUES (?,?,?,?, 'Text','Global',0,'')").run(key, fk, fp, name);
+    }
+    w.prepare("INSERT INTO orch_queue VALUES ('q1','f-x','Other','Traced_Q','{}')").run();
+    w.close();
+    assert.equal(run(ix, "review").status, 0);
+    const db = openDb(ix);
+    const f = db.prepare("SELECT rule, subject, detail FROM finding WHERE rule LIKE 'AI-RES-%'").all();
+    assert.ok(db.prepare("SELECT count(*) n FROM edge WHERE kind='reads_credential' AND detail LIKE '%folder=Elsewhere%'").get().n === 1);
+    assert.ok(!f.some((x) => x.subject === "Rel"), JSON.stringify(f)); // ".." from Shared/Child is Shared, where Rel exists
+    assert.ok(!f.some((x) => x.subject === "Dyn"), JSON.stringify(f)); // unknown folder: no claim either way
+    assert.ok(f.some((x) => x.rule === "AI-RES-003" && x.subject === "Traced_Q" && /Elsewhere/.test(x.detail)), JSON.stringify(f));
+  });
+
+  test("R8 a Project.JSON source folder is discovered", () => {
+    const d = path.join(tmp, "r8");
+    write(path.join(d, "repo", "P", "Project.JSON"), JSON.stringify({ name: "Upper", main: "Main.xaml" }));
+    write(path.join(d, "repo", "P", "Main.xaml"), SIMPLE.replace("ASSET_NAME", "A"));
+    run(path.join(d, "ix"), "extract", "--source", path.join(d, "repo"));
+    assert.equal(openDb(path.join(d, "ix")).prepare("SELECT package_id FROM package").get()?.package_id, "Upper");
+  });
+
+  test("R12/R13/R14/R15 identity, competing assignments, Config dictionaries, partial metadata", () => {
+    const d = path.join(tmp, "r12");
+    const cfg = xlsx({ Settings: [["Name", "Value"], ["K", "Base"]] });
+    proj(path.join(d, "repo", "P"), "P", {
+      "Main.xaml": act(`<Sequence sap2010:WorkflowViewState.IdRef="S1"><ui:AddQueueItem QueueName="Same"/><ui:AddQueueItem QueueName="Same"/>
+<Assign sap2010:WorkflowViewState.IdRef="A1"><Assign.To><OutArgument x:TypeArguments="x:String">[q]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">Old</InArgument></Assign.Value></Assign>
+<Assign sap2010:WorkflowViewState.IdRef="A2"><Assign.To><OutArgument x:TypeArguments="x:String">[q]</OutArgument></Assign.To><Assign.Value><InArgument x:TypeArguments="x:String">New</InArgument></Assign.Value></Assign>
+<ui:AddQueueItem QueueName="[q]" sap2010:WorkflowViewState.IdRef="Q9"/>
+<ui:AddQueueItem QueueName="[io_DictConfig(&quot;K&quot;)]" sap2010:WorkflowViewState.IdRef="Q8"/></Sequence>`),
+    });
+    fs.writeFileSync(path.join(d, "repo", "P", "Config.xlsx"), cfg);
+    proj(path.join(d, "repo", "Q"), "Q", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "A"), "Child.xaml": SIMPLE.replace("ASSET_NAME", "B"), "entry-points.json": JSON.stringify({ entryPoints: [{ filePath: "Main.xaml" }] }) });
+    write(path.join(d, "repo", "Q", "project.json"), "{broken");
+    run(path.join(d, "ix"), "extract", "--source", path.join(d, "repo"));
+    const db = openDb(path.join(d, "ix"));
+    assert.equal(db.prepare("SELECT count(*) n FROM edge WHERE kind='uses_queue' AND normalized='same'").get().n, 2);
+    const traced = db.prepare("SELECT normalized, confidence FROM edge WHERE kind='uses_queue' AND activity LIKE 'Q9%' AND normalized IN ('old','new')").all();
+    assert.ok(traced.every((r) => r.confidence === "low"), JSON.stringify(traced));
+    // Every real settings dictionary name ends in Config (in_Config, io_DictConfig, DictionaryConfig...): resolved.
+    assert.equal(db.prepare("SELECT count(*) n FROM edge WHERE kind='uses_queue' AND normalized='base' AND activity LIKE 'Q8%'").get().n, 1);
+    assert.equal(db.prepare("SELECT reachable FROM workflow WHERE package_id='Q' AND path='Child.xaml'").get().reachable, null);
+  });
+
+  test("R16/R17/R18 column names, folder-name collisions, long declarations", () => {
+    const d = path.join(tmp, "r16");
+    proj(path.join(d, "repo", "a", "Foo"), "Foo", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "One") });
+    proj(path.join(d, "repo", "b", "foo"), "foo", { "Main.xaml": SIMPLE.replace("ASSET_NAME", "Two") });
+    run(path.join(d, "ix"), "extract", "--source", path.join(d, "repo"));
+    const dirs = fs.readdirSync(path.join(d, "ix", "src"));
+    assert.equal(new Set(dirs.map((x) => x.toLowerCase())).size, 2, dirs.join(","));
+    const r = run(path.join(d, "ix"), "query", 'SELECT 1 AS x, 2 AS x, 3 AS "x:1"', "--format", "json");
+    assert.deepEqual(Object.values(JSON.parse(r.stdout)[0]).sort(), [1, 2, 3]);
+    const decl = Buffer.concat([Buffer.from(`<?xml version="1.0"${" ".repeat(300)}encoding="ISO-8859-1"?><r>`), Buffer.from([0xc3, 0xa9]), Buffer.from("</r>")]);
+    assert.equal(m.parseXml(decl).text, "\u00c3\u00a9");
+  });
+});
