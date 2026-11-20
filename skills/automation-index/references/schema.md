@@ -27,7 +27,7 @@ node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT 
 
 | Table | One row per | Key columns |
 |---|---|---|
-| `package` | package version read, or project folder read | `package_id`, `version` (the package version, or `source:PATH` for a project folder), `kind` (process/library/other), `origin` (download/supplied/source), `layout` (modern/legacy/source/compiled), `has_sources`, `target_framework`, `studio_version`, `sha256`, `solution` (folder of the enclosing `.uipx`, for sources), `file_path` |
+| `package` | package version read, or project folder read | `package_id`, `version` (the package version, or `source:PATH` for a project folder), `kind` (process/library/other), `origin` (download/supplied/source), `layout` (modern/legacy/source/compiled), `has_sources`, `framework` (`REFramework` when its standard files are present), `target_framework`, `studio_version`, `sha256`, `solution` (folder of the enclosing `.uipx`, for sources), `file_path` |
 | `coverage` | package × stage | `stage` (download/extract), `status` (ok/indexed/compiled_only/unsupported/parse_error/download_failed), `detail` |
 | `dependency` | package dependency | `dep_name`, `dep_spec`, `dep_version` (exact when pinned, else NULL), `is_activity_pack` |
 | `entry_point` | entry point | `path`, `source` |
@@ -35,7 +35,8 @@ node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT 
 | `invocation` | Invoke Workflow / Invoke Process call | `from_path`, `line`, `kind`, `target_raw`, `target_path`, `static` |
 | `edge` | fact: the automation touches something | see below |
 | `config_key` | Config.xlsx / config JSON key | `sheet`, `name`, `value` (credential-like values redacted), `redacted` |
-| `binding` | resource in `bindings_v2.json` | `resource`, `name`, `folder_path` |
+| `binding` | resource in `bindings_v2.json`, also read from Maestro, Flow and agent packages | `resource`, `name`, `folder_path` |
+| `activity_use` | activity type per package | `activity` (Studio type name, such as `If`, `TryCatch`, `NClick`), `count` |
 
 ### From analysis and review
 
@@ -44,8 +45,9 @@ node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT 
 | `analyzer_run` | one row per package: `status` (ok/failed/skipped_platform/skipped_no_source_tree), counts, policy |
 | `analyzer_finding` | Workflow Analyzer output, verbatim: `level`, `rule`, `file`, `activity_id`, `description` |
 | `finding` | review findings: `rule`, `severity`, `subject`, `detail`, `evidence`, `process_key` |
-| `ai_summary` | summaries written by an agent: `model`, `text`, `source_sha256`. Non-authoritative. |
-| `meta` | `crawl_finished`, `crawl_tenant`, `jobs_window_days`, `jobs_truncated`, `crawl_errors`, tool versions |
+| `ai_summary` | summaries written by an agent: `model`, `text`, `source_sha256`, and the claim-by-claim `review` they passed. Non-authoritative. |
+| `process_link` | links between deployed processes: `from_key`, `to_key`, `via` (`queue` or `process`), `resource`, evidence on both sides. Rebuilt each time the index is opened |
+| `meta` | `crawl_finished`, `crawl_tenant`, `jobs_window_days`, `jobs_truncated`, `crawl_errors`, `inventory_<type>_ok`, `schema_version`, tool versions |
 
 ## The `edge` table
 
@@ -62,7 +64,7 @@ node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT 
 
 There is one row per distinct value per activity. Where there is no activity (coded workflow lines, Config rows, DLL strings), there is one row per value per line. Values are scrubbed of credential material before they are stored.
 
-Edge kinds: `uses_application`, `targets_url`, `calls_api`, `reads_asset`, `writes_asset`, `reads_credential`, `writes_credential`, `uses_queue` (detail starts with `add` or `get`), `uses_bucket`, `invokes_process`, `uses_connection` (Integration Service), `uses_database`, `sends_email_to_domain`, `uses_mail_server`, `runs_code`, `ui_technology` (selector root tag: `wnd`, `html`, `sap`, `java`, `uia`, `citrix`...), `window_title`, `uses_file`, `uses_config_key`, `uses_or_descriptor`, `hardcoded_secret` (value always redacted).
+Edge kinds: `uses_application`, `targets_url`, `calls_api`, `reads_asset`, `writes_asset`, `reads_credential`, `writes_credential`, `uses_queue` (detail contains `mode=add` or `mode=get`), `uses_bucket`, `invokes_process`, `uses_connection` (Integration Service), `uses_database`, `sends_email_to_domain`, `uses_mail_server`, `runs_code`, `ui_technology` (selector root tag: `wnd`, `html`, `sap`, `java`, `uia`, `citrix`...), `window_title`, `uses_file`, `uses_config_key`, `uses_or_descriptor`, `hardcoded_secret` (value always redacted).
 
 ## Views
 
@@ -72,6 +74,7 @@ Edge kinds: `uses_application`, `targets_url`, `calls_api`, `reads_asset`, `writ
 | `v_edge_all` | every edge of a package **including edges inherited from its libraries**; `via` shows the library path, empty for direct edges |
 | `v_process_edge` | `v_edge_all` joined to deployed processes: the usual starting point for a question |
 | `v_dep_closure` | transitive library dependencies (pinned versions only) |
+| `v_process_link` | which automation feeds which: queue handovers (one writes, another reads) and process calls, including calls from Maestro and Flow packages |
 
 ## Example queries
 
@@ -131,6 +134,14 @@ Projects per solution, for an index built from a repository:
 SELECT COALESCE(solution, '(no solution)') AS solution, count(*) AS projects,
        group_concat(package_id, ', ') AS names
 FROM package WHERE origin = 'source' AND kind <> 'other' GROUP BY solution;
+```
+
+What runs downstream of an automation, and what feeds it?
+
+```sql
+SELECT p1.name AS from_automation, l.via, l.resource, p2.name AS to_automation, l.from_evidence
+FROM v_process_link l JOIN process p1 ON p1.key = l.from_key JOIN process p2 ON p2.key = l.to_key
+WHERE p1.name = 'PROCESS_NAME' OR p2.name = 'PROCESS_NAME';
 ```
 
 What is unknown? Run this before you answer "none" or "all":

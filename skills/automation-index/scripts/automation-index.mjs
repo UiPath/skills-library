@@ -30,7 +30,9 @@ import { pathToFileURL } from "node:url";
 
 const TOOL_VERSION = "1.0.0";
 // Bump when extraction logic changes; packages indexed by an older extractor are re-read.
-const EXTRACTOR_VERSION = 2;
+const EXTRACTOR_VERSION = 3;
+// Version of the table and export layout other tools read (bumped on incompatible changes).
+const SCHEMA_VERSION = 1;
 const PAGE = 50;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_FILE_BYTES = 50 * 1024 * 1024; // any single file read from a package or project
@@ -121,7 +123,7 @@ CREATE TABLE IF NOT EXISTS package (
   sha256 TEXT, layout TEXT, has_sources INTEGER, project_name TEXT,
   description TEXT, output_type TEXT, target_framework TEXT,
   expression_language TEXT, studio_version TEXT, main TEXT,
-  extractor_version INTEGER, indexed_at TEXT, solution TEXT,
+  extractor_version INTEGER, indexed_at TEXT, solution TEXT, framework TEXT,
   PRIMARY KEY (package_id, version));
 
 CREATE TABLE IF NOT EXISTS coverage (
@@ -172,10 +174,22 @@ CREATE TABLE IF NOT EXISTS finding (
 
 CREATE TABLE IF NOT EXISTS ai_summary (
   package_id TEXT, version TEXT, model TEXT, text TEXT, source_sha256 TEXT,
-  written_at TEXT, PRIMARY KEY (package_id, version));
+  written_at TEXT, review TEXT, reviewed_at TEXT, PRIMARY KEY (package_id, version));
+
+CREATE TABLE IF NOT EXISTS activity_use (
+  package_id TEXT, version TEXT, activity TEXT, count INTEGER);
+
+-- Links between deployed processes: a queue one writes and another reads, or a process call
+-- (including calls from Maestro, Flow and agent packages through their bindings). Rebuilt by refreshClosure.
+CREATE TABLE IF NOT EXISTS process_link (
+  from_key TEXT, from_name TEXT, to_key TEXT, to_name TEXT, via TEXT, resource TEXT,
+  from_evidence TEXT, to_evidence TEXT);
 
 CREATE INDEX IF NOT EXISTS ix_edge_pkg ON edge (package_id, version, kind, normalized);
 CREATE INDEX IF NOT EXISTS ix_finding_pkg ON finding (package_id, version);
+CREATE INDEX IF NOT EXISTS ix_activity_pkg ON activity_use (package_id, version);
+CREATE INDEX IF NOT EXISTS ix_link_from ON process_link (from_key);
+CREATE INDEX IF NOT EXISTS ix_link_to ON process_link (to_key);
 CREATE INDEX IF NOT EXISTS ix_entry_pkg ON entry_point (package_id, version);
 CREATE INDEX IF NOT EXISTS ix_edge_kind ON edge (kind, normalized);
 CREATE INDEX IF NOT EXISTS ix_dep_pkg ON dependency (package_id, version);
@@ -190,6 +204,9 @@ CREATE INDEX IF NOT EXISTS ix_closure_pkg ON dep_closure (package_id, version);
 
 DROP VIEW IF EXISTS v_dep_closure;
 CREATE VIEW v_dep_closure AS SELECT * FROM dep_closure;
+
+DROP VIEW IF EXISTS v_process_link;
+CREATE VIEW v_process_link AS SELECT * FROM process_link;
 
 DROP VIEW IF EXISTS v_edge_all;
 CREATE VIEW v_edge_all AS
@@ -529,9 +546,12 @@ function connect(indexDir) {
     if (st && st.isSymbolicLink()) throw new Exit(`${path.join(indexDir, f)} is a symbolic link; refusing to open it. Remove it and retry.`);
   }
   const db = new DB(path.join(indexDir, "index.db"));
-  try { // indexes created before the solution column existed
-    db.exec("ALTER TABLE package ADD COLUMN solution TEXT");
-  } catch { /* column exists or table not created yet */ }
+  // Columns added after the first release: add them to older indexes.
+  for (const [table, column] of [["package", "solution"], ["package", "framework"], ["ai_summary", "review"], ["ai_summary", "reviewed_at"]]) {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} TEXT`);
+    } catch { /* column exists or table not created yet */ }
+  }
   try { // ix_edge_pkg used to cover (package_id, version) only
     const def = db.one("SELECT sql FROM sqlite_master WHERE name='ix_edge_pkg'");
     if (def && !/kind/.test(def[0])) db.exec("DROP INDEX ix_edge_pkg");
@@ -539,6 +559,7 @@ function connect(indexDir) {
   db.exec(SCHEMA);
   db.run("INSERT OR REPLACE INTO meta VALUES ('tool_version', ?)", TOOL_VERSION);
   db.run("INSERT OR REPLACE INTO meta VALUES ('extractor_version', ?)", String(EXTRACTOR_VERSION));
+  db.run("INSERT OR REPLACE INTO meta VALUES ('schema_version', ?)", String(SCHEMA_VERSION));
   db.commit();
   refreshClosure(db);
   return db;
@@ -581,6 +602,25 @@ function refreshClosure(db) {
       }
     }
   }
+  db.commit();
+  refreshLinks(db);
+}
+
+/** Process-to-process links: queue handovers (one writes, another reads) and process calls. */
+function refreshLinks(db) {
+  db.run("DELETE FROM process_link");
+  db.run(`INSERT INTO process_link
+    SELECT a.process_key, min(a.process_name), b.process_key, min(b.process_name), 'queue', a.normalized,
+           min(a.file || COALESCE(':' || a.line, '')), min(b.file || COALESCE(':' || b.line, ''))
+    FROM v_process_edge a JOIN v_process_edge b
+      ON b.kind = 'uses_queue' AND b.normalized = a.normalized AND b.process_key <> a.process_key AND b.detail LIKE '%mode=get%'
+    WHERE a.kind = 'uses_queue' AND a.normalized <> '<dynamic>' AND a.detail LIKE '%mode=add%'
+    GROUP BY a.process_key, b.process_key, a.normalized`);
+  db.run(`INSERT INTO process_link
+    SELECT a.process_key, min(a.process_name), p.key, p.name, 'process', a.normalized, min(a.file || COALESCE(':' || a.line, '')), NULL
+    FROM v_process_edge a JOIN process p ON lower(p.name) = a.normalized AND p.key <> a.process_key
+    WHERE a.kind = 'invokes_process' AND a.normalized <> '<dynamic>'
+    GROUP BY a.process_key, p.key`);
   db.commit();
 }
 
@@ -1213,7 +1253,8 @@ class PackageExtractor {
     this.invocations = [];
     this.workflows = [];
     this.argBindings = []; // [caller file, target raw, argument name, Val, ctx]
-    this.varSources = new Map(); // "file\0variable" -> [["val", Val, line] | ["asset", name, line]]
+    this.varSources = new Map();
+    this.activityUse = new Map(); // activity type -> count (fingerprint and complexity signals) // "file\0variable" -> [["val", Val, line] | ["asset", name, line]]
   }
 
   edge(kind, value, ctx, normalized = null, detail = null, stat = true, extractor = "xaml", confidence = "high") {
@@ -1310,6 +1351,7 @@ class PackageExtractor {
         const dn = node.attrs.DisplayName;
         ctx = { file: rel, line: node.line, activity: `${label}` + (dn ? ` (${dn})` : ""), activity_type: node.local };
         if (idref) count++;
+        this.activityUse.set(node.local, (this.activityUse.get(node.local) || 0) + 1);
       } else {
         ctx = { ...parentCtx, line: node.line };
       }
@@ -1359,7 +1401,7 @@ class PackageExtractor {
     } else if (QUEUE_ADD.has(L) || QUEUE_GET.has(L)) {
       const mode = QUEUE_ADD.has(L) ? "add" : "get";
       const f = this.folderOf(n);
-      this.valueEdge("uses_queue", firstProp(n, "QueueName", "QueueType"), ctx, extractor, mode + (f ? "; " + f : ""));
+      this.valueEdge("uses_queue", firstProp(n, "QueueName", "QueueType"), ctx, extractor, `mode=${mode}` + (f ? "; " + f : ""));
     } else if (PROCESS_CALL.has(L)) {
       this.valueEdge("invokes_process", firstProp(n, "ProcessName"), ctx, extractor, this.folderOf(n));
       const v = firstProp(n, "ProcessName");
@@ -1701,7 +1743,7 @@ class PackageExtractor {
       if (!ident) return;
       const ctx = { file: e[7], line: e[8], activity: e[9], activity_type: e[10] };
       const notes = [];
-      const folderPart = (/(?:^|; )(folder=[^;]+)/.exec(e[5] || "") || [])[1];
+      const folderPart = [(/(?:^|; )(mode=(?:add|get))/.exec(e[5] || "") || [])[1], (/(?:^|; )(folder=[^;]+)/.exec(e[5] || "") || [])[1]].filter(Boolean).join("; ");
       const results = trace(ident, e[7], 1, "traced", e[8]);
       // Several different values assigned earlier in the file: which one reaches the read is not proven.
       const assigned = new Set(results.filter((r) => r[0] === "value" && / assigned at /.test(r[2].split(" <- ")[1] || "")).map((r) => r[1]));
@@ -1718,6 +1760,7 @@ class PackageExtractor {
   }
 
   flush() {
+    for (const [act, n] of this.activityUse) this.db.run("INSERT INTO activity_use VALUES (?,?,?,?)", this.pkg, this.ver, act, n);
     for (const e of this.edges) this.db.run("INSERT INTO edge VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", ...e);
     for (const i of this.invocations) this.db.run("INSERT INTO invocation VALUES (?,?,?,?,?,?,?,?,?,?)", ...i);
     for (const w of this.workflows) this.db.run("INSERT INTO workflow VALUES (?,?,?,?,?,?,?,?)", ...w);
@@ -1907,6 +1950,8 @@ function openPackage(p) {
   const z = new Zip(fs.readFileSync(p));
   const names = z.names();
   const root = projectRootInZip(names);
+  // No project.json (Maestro, Flow, agent packages): still read content/ for bindings and metadata.
+  const readRoot = root ?? (names.some((n) => n.startsWith("content/")) ? "content/" : "");
   const files = new Map();
   const dlls = new Map();
   const skipped = [];
@@ -1918,8 +1963,8 @@ function openPackage(p) {
       dlls.set(n, z.read(e));
       continue;
     }
-    if (root === null || !n.startsWith(root)) continue;
-    const rel = safeRel(n.slice(root.length));
+    if (!n.startsWith(readRoot)) continue;
+    const rel = safeRel(n.slice(readRoot.length));
     if (rel) files.set(rel, z.read(e));
   }
   const layout = root === null ? "unknown" : ({ "content/": "modern", "lib/net45/": "legacy" }[root] || "other");
@@ -1940,7 +1985,7 @@ function writeTree(indexDir, pkg, ver, files) {
 }
 
 function deletePackageRows(db, pkg, ver) {
-  for (const t of ["edge", "invocation", "workflow", "dependency", "entry_point", "config_key", "binding", "analyzer_run", "analyzer_finding", "finding"]) {
+  for (const t of ["edge", "invocation", "workflow", "dependency", "entry_point", "config_key", "binding", "analyzer_run", "analyzer_finding", "finding", "activity_use"]) {
     db.run(`DELETE FROM ${t} WHERE package_id=? AND version=?`, pkg, ver);
   }
   db.run("DELETE FROM coverage WHERE package_id=? AND version=? AND stage LIKE 'config:%'", pkg, ver);
@@ -1973,6 +2018,42 @@ function pyScalar(v) {
   return String(v);
 }
 
+const BINDING_KINDS = { asset: "reads_asset", queue: "uses_queue", process: "invokes_process", bucket: "uses_bucket",
+  connection: "uses_connection", eventtrigger: "uses_connection", app: "uses_app", index: "uses_context_index" };
+
+/** Resources a package declares in bindings_v2.json: assets, queues, processes it calls, connections. */
+function readBindings(db, ex, pkg, ver, files) {
+  for (const bname of ["bindings_v2.json", "bindings.json", ".local/content/bindings_v2.json"]) {
+    const b = files.get(bname);
+    if (!b) continue;
+    let doc;
+    try {
+      doc = jsonLoads(b);
+    } catch {
+      continue;
+    }
+    if (!isObject(doc)) throw new TypeError(`${bname} is not an object`);
+    let n = 0;
+    for (const r of doc.resources || []) {
+      if (!isObject(r)) continue;
+      const res = String(r.resource || "").toLowerCase();
+      const val = isObject(r.value) ? r.value : {};
+      const meta = isObject(r.metadata) ? r.metadata : {};
+      const dv = (k) => (isObject(val[k]) ? val[k].defaultValue ?? null : null);
+      const name = dv("name") || meta.Connector || r.key || null;
+      const folder = dv("folderPath");
+      db.run("INSERT INTO binding VALUES (?,?,?,?,?,?,?,?)", pkg, ver, res, name, folder, r.key ?? null, r.workflowRelativePath ?? null, cut(pyDumps(redactSecretKeys(meta)), 2000));
+      if (res in BINDING_KINDS && name) {
+        const ctx = { file: bname, line: null, activity: meta.ActivityName ?? null, activity_type: "binding" };
+        ex.edge(BINDING_KINDS[res], name, ctx, String(name).toLowerCase(), folder ? `folder=${folder}` : null, true, "package_bindings", "high");
+        n++;
+      }
+    }
+    return n;
+  }
+  return 0;
+}
+
 function extractOne(db, indexDir, p, kind = "process", origin = "download", force = false, label = null, solution = null) {
   const [files, info] = openPackage(p);
   const isDir = fs.statSync(p).isDirectory();
@@ -1986,7 +2067,12 @@ function extractOne(db, indexDir, p, kind = "process", origin = "download", forc
     forgetOtherIdentities(db, indexDir, p, origin, pid, ver);
     db.run("INSERT OR REPLACE INTO package (package_id, version, kind, origin, file_path, layout, has_sources, extractor_version, indexed_at, solution) " +
       "VALUES (?,?,?,?,?,?,?,?,?,?)", pid, ver, kind, origin, p, info.layout, 0, EXTRACTOR_VERSION, now(), solution);
-    coverage(db, pid, ver, "extract", "unsupported", "no project.json found (agent, flow, app or other package type)");
+    // Maestro, Flow and agent packages: workflows are not read, but their bindings name the processes they call.
+    const ex = new PackageExtractor(db, pid, ver, p, new Map());
+    const bound = readBindings(db, ex, pid, ver, files);
+    ex.flush();
+    coverage(db, pid, ver, "extract", "unsupported", "no project.json found (agent, flow, app or other package type)" +
+      (bound ? `; ${bound} resource bindings read (processes it calls, queues, assets, connections)` : ""));
     return [pid, ver];
   }
   let pj;
@@ -2024,11 +2110,14 @@ function extractOne(db, indexDir, p, kind = "process", origin = "download", forc
   const sources = [...files.keys()].filter((r) => /\.(xaml|cs)$/i.test(r) && !r.startsWith(".local/") && !r.startsWith(".tmh/") && !r.includes("/.local/"));
   const hasSources = sources.length ? 1 : 0;
   const design = isObject(pj.designOptions) ? pj.designOptions : {};
-  db.run("INSERT OR REPLACE INTO package VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+  const lowerNames = new Set([...files.keys()].map((k) => k.toLowerCase()));
+  const framework = ["framework/initallsettings.xaml", "framework/gettransactiondata.xaml", "framework/settransactionstatus.xaml"]
+    .every((f) => lowerNames.has(f)) ? "REFramework" : null;
+  db.run("INSERT OR REPLACE INTO package VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
     pkg, ver, kind, origin, p, digest, hasSources ? info.layout : "compiled", hasSources, pj.name ?? null, pj.description ?? null,
     design.outputType || (kind === "library" ? "Library" : null),
     pj.targetFramework || (info.layout === "legacy" ? "Legacy" : null),
-    pj.expressionLanguage ?? null, pj.studioVersion ?? null, pj.main ?? null, EXTRACTOR_VERSION, now(), solution);
+    pj.expressionLanguage ?? null, pj.studioVersion ?? null, pj.main ?? null, EXTRACTOR_VERSION, now(), solution, framework);
 
   const deps = isObject(pj.dependencies) ? pj.dependencies : {};
   for (const [n, s] of Object.entries(deps)) {
@@ -2112,35 +2201,7 @@ function extractOne(db, indexDir, p, kind = "process", origin = "download", forc
   }
 
   // Package bindings (present even in compiled-only packages).
-  const kindMap = { asset: "reads_asset", queue: "uses_queue", process: "invokes_process", bucket: "uses_bucket",
-    connection: "uses_connection", eventtrigger: "uses_connection", app: "uses_app", index: "uses_context_index" };
-  for (const bname of ["bindings_v2.json", "bindings.json", ".local/content/bindings_v2.json"]) {
-    const b = files.get(bname);
-    if (!b) continue;
-    let doc;
-    try {
-      doc = jsonLoads(b);
-    } catch {
-      continue;
-    }
-    if (!isObject(doc)) throw new TypeError(`${bname} is not an object`);
-    for (const r of doc.resources || []) {
-      if (!isObject(r)) continue;
-      const res = String(r.resource || "").toLowerCase();
-      const val = isObject(r.value) ? r.value : {};
-      const meta = isObject(r.metadata) ? r.metadata : {};
-      const dv = (k) => (isObject(val[k]) ? val[k].defaultValue ?? null : null);
-      const name = dv("name") || meta.Connector || r.key || null;
-      const folder = dv("folderPath");
-      const safeMeta = redactSecretKeys(meta);
-      db.run("INSERT INTO binding VALUES (?,?,?,?,?,?,?,?)", pkg, ver, res, name, folder, r.key ?? null, r.workflowRelativePath ?? null, cut(pyDumps(safeMeta), 2000));
-      if (res in kindMap && name) {
-        const ctx = { file: bname, line: null, activity: meta.ActivityName ?? null, activity_type: "binding" };
-        ex.edge(kindMap[res], name, ctx, String(name).toLowerCase(), folder ? `folder=${folder}` : null, true, "package_bindings", "high");
-      }
-    }
-    break;
-  }
+  readBindings(db, ex, pkg, ver, files);
 
   if (!hasSources) for (const [rel, data] of info.dlls) ex.dllStrings(rel, data, pj.name ?? null);
 
@@ -2748,6 +2809,8 @@ const RULES = [
      FROM analyzer_finding f WHERE f.level IN ('Error','Critical')`)],
   ["AI-WA-002", "Info", "Workflow Analyzer could not run on this package", (db) => db.rows(
     "SELECT package_id, version, NULL, status, detail, NULL FROM analyzer_run WHERE status <> 'ok'")],
+  ["AI-LNK-001", "Info", "Queue written by an automation but read by none of the indexed automations", (db) => queueHandoverRule(db, "add")],
+  ["AI-LNK-002", "Info", "Queue read by an automation but written by none of the indexed automations", (db) => queueHandoverRule(db, "get")],
   ["AI-GOV-001", "Critical", "Application or URL outside the restriction list", (db, ctx) => restrictionRule(db, ctx)],
 ];
 
@@ -2755,7 +2818,7 @@ const RULES = [
 function inventoryUsable(db, type) {
   const flag = db.one("SELECT value FROM meta WHERE key=?", `inventory_${type}_ok`);
   if (flag) return flag[0] === "1";
-  return !!db.one(`SELECT 1 FROM orch_${type} LIMIT 1`); // indexes from before the flag existed
+  return !!db.one(`SELECT 1 FROM ${type === "process" ? "process" : "orch_" + type} LIMIT 1`); // indexes from before the flag existed
 }
 
 /** Folder an activity names, resolved like Orchestrator does: "." and ".." are relative to the process's folder. */
@@ -2804,6 +2867,23 @@ function resourceRule(db, type, check) {
   }
   return [...groups.values()].map((g) => [...g.row,
     `kind=${g.kind}; ${g.problem}; process folder ${S(g.pfolder)}${g.via ? "; via " + g.via : ""}; ${g.n} references`, g.first]);
+}
+
+/** Queues with only one side of the handover among the indexed automations. */
+function queueHandoverRule(db, side) {
+  if (!inventoryUsable(db, "process")) return [];
+  const other = side === "add" ? "get" : "add";
+  const gaps = db.one("SELECT count(*) FROM coverage WHERE stage='extract' AND status NOT IN ('indexed','ok')")[0];
+  const caveat = side === "add"
+    ? "no indexed automation reads it; it may be read outside UiPath, by a dynamic queue name, or by a package that could not be read"
+    : "no indexed automation writes it; items may come from outside UiPath (API, other systems), a dynamic queue name, or a package that could not be read";
+  return db.rows(`SELECT NULL, NULL, group_concat(DISTINCT a.process_key), a.normalized,
+           '${side === "add" ? "written" : "read"} by ' || group_concat(DISTINCT a.process_name) || '; ' || ? || '; ' || ? || ' packages not fully read',
+           min(a.file || COALESCE(':' || a.line, ''))
+     FROM v_process_edge a
+     WHERE a.kind = 'uses_queue' AND a.normalized <> '<dynamic>' AND a.detail LIKE '%mode=${side}%'
+       AND NOT EXISTS (SELECT 1 FROM edge b WHERE b.kind = 'uses_queue' AND b.normalized = a.normalized AND b.detail LIKE '%mode=${other}%')
+     GROUP BY a.normalized`, caveat, gaps);
 }
 
 function restrictionRule(db, ctx) {
@@ -2941,7 +3021,7 @@ function cardFor(db, pkg, ver, proc = null) {
     ["Process type", proc ? proc.process_type : get("output_type")],
     ["Target framework", get("target_framework")], ["Studio version", get("studio_version")],
     ["Expression language", get("expression_language")], ["Sources in package", get("has_sources") ? "yes" : "**no**"],
-    ["Solution", get("solution")], ["Read from", get("origin") === "source" ? get("file_path") : get("origin")],
+    ["Solution", get("solution")], ["Framework", get("framework")], ["Read from", get("origin") === "source" ? get("file_path") : get("origin")],
     ["Description", get("description")]];
   for (const [name, val] of rows) out.push(`| ${name} | ${md(val) || "—"} |`);
   out.push("");
@@ -2963,6 +3043,14 @@ function cardFor(db, pkg, ver, proc = null) {
       out.push(`- Trigger: ${tt} \`${S(nm)}\` (${en ? "enabled" : "disabled"})`);
     }
     out.push("");
+    const up = db.rows("SELECT from_name, via, resource, from_evidence FROM process_link WHERE to_key=? ORDER BY from_name", proc.key);
+    const down = db.rows("SELECT to_name, via, resource, from_evidence FROM process_link WHERE from_key=? ORDER BY to_name", proc.key);
+    if (up.length || down.length) {
+      out.push("## Linked automations\n\n| Direction | Automation | Via | Resource | Evidence |\n|---|---|---|---|---|");
+      for (const [n, via, res, ev] of up) out.push(`| upstream (feeds this) | ${md(n)} | ${via} | ${md(res)} | ${md(ev)} |`);
+      for (const [n, via, res, ev] of down) out.push(`| downstream (fed by this) | ${md(n)} | ${via} | ${md(res)} | ${md(ev)} |`);
+      out.push("");
+    }
   }
   for (const [heading, kinds] of EDGE_SECTIONS) {
     const rows2 = db.rows(`SELECT kind, normalized, min(value), group_concat(DISTINCT extractor), count(*),
@@ -3005,11 +3093,12 @@ function cardFor(db, pkg, ver, proc = null) {
     for (const r of fnd) out.push("| " + r.map(md).join(" | ") + " |");
     out.push("");
   }
-  const s = db.one("SELECT model, text, source_sha256, written_at FROM ai_summary WHERE package_id=? AND version=?", pkg, ver);
+  const s = db.one("SELECT model, text, source_sha256, written_at, review FROM ai_summary WHERE package_id=? AND version=?", pkg, ver);
   if (s) {
     const stale = s[2] !== get("sha256");
+    const checked = (String(s[4] || "").match(/\bSUPPORTED\b/g) || []).length;
     out.push(`## AI summary (non-authoritative${stale ? "; STALE — package changed since" : ""})\n`);
-    out.push(`_Written by ${S(s[0])} on ${S(s[3])}. Verify against the facts above before relying on it._\n`);
+    out.push(`_Written by ${S(s[0])} on ${S(s[3])}; ${checked} claims checked against the index before it was stored. Verify against the facts above before relying on it._\n`);
     out.push(String(s[1]).trim() + "\n");
   }
   out.push("## Provenance\n");
@@ -3164,21 +3253,91 @@ function cmdStatus(a) {
   }
 }
 
+/** A review lists every claim of the summary with a verdict (SUPPORTED, UNSUPPORTED, CONTRADICTED) and its
+ * evidence. A summary is stored only when every claim is SUPPORTED: the second pass tries to disprove the first. */
+function checkReview(text) {
+  const bad = (text.match(/\b(UNSUPPORTED|CONTRADICTED)\b/g) || []).length;
+  const good = (text.match(/\bSUPPORTED\b/g) || []).length - (text.match(/\bUNSUPPORTED\b/g) || []).length;
+  if (bad) throw new Exit(`review lists ${bad} claim(s) as UNSUPPORTED or CONTRADICTED: remove or correct them in the summary, review again, then store it.`);
+  if (good < 1) throw new Exit("review lists no SUPPORTED claims: check each claim of the summary against the index (see references/summary-review.md).");
+  return good;
+}
+
 function cmdSummary(a) {
   const db = connect(a.indexDir);
   if (a.action === "list") {
-    for (const r of db.rows("SELECT s.package_id, s.version, s.model, s.written_at, s.source_sha256 = k.sha256 FROM ai_summary s LEFT JOIN package k USING (package_id, version)")) {
-      console.log(`${r[0]}@${r[1]}  ${r[2]}  ${r[3]}  ${r[4] ? "current" : "STALE"}`);
+    for (const r of db.rows("SELECT s.package_id, s.version, s.model, s.written_at, s.source_sha256 = k.sha256, s.review IS NOT NULL FROM ai_summary s LEFT JOIN package k USING (package_id, version)")) {
+      console.log(`${r[0]}@${r[1]}  ${r[2]}  ${r[3]}  ${r[4] ? "current" : "STALE"}  ${r[5] ? "reviewed" : "NOT REVIEWED"}`);
     }
     return;
   }
-  if (!(a.package && a.version && a.model && a.file)) throw new Exit("summary set needs --package --version --model --file");
+  if (!(a.package && a.version && a.model && a.file && a.review)) throw new Exit("summary set needs --package --version --model --file --review");
   const k = db.one("SELECT sha256 FROM package WHERE package_id=? AND version=?", a.package, a.version);
   if (!k) throw new Exit("package not in index");
   const text = fs.readFileSync(a.file, "utf8");
-  db.run("INSERT OR REPLACE INTO ai_summary VALUES (?,?,?,?,?,?)", a.package, a.version, a.model, text, k[0], now());
+  const review = fs.readFileSync(a.review, "utf8");
+  const n = checkReview(review);
+  db.run("INSERT OR REPLACE INTO ai_summary (package_id, version, model, text, source_sha256, written_at, review, reviewed_at) VALUES (?,?,?,?,?,?,?,?)",
+    a.package, a.version, a.model, text, k[0], now(), review, now());
   db.commit();
-  console.log("stored (labelled non-authoritative)");
+  console.log(`stored (labelled non-authoritative; ${n} claims checked)`);
+}
+
+// ---------------------------------------------------------------------------- export
+
+const HITL = new Set(["CreateTask", "CreateFormTask", "WaitForTaskCompletion", "WaitForFormTaskAndResume", "CreateExternalTask",
+  "WaitForExternalTaskAndResume", "SuspendWorkflow", "ResumeWorkflow", "CreateDocumentValidationAction", "WaitForDocumentValidationActionAndResume"]);
+const DECISIONS = new Set(["If", "IfElseIf", "ElseIf", "FlowDecision", "Switch", "FlowSwitch"]);
+const EXCEPTIONS = new Set(["TryCatch", "Throw", "Rethrow"]);
+const RETRIES = new Set(["RetryScope", "Retry"]);
+const LOOPS = new Set(["ForEach", "ParallelForEach", "While", "DoWhile", "ForEachRow", "ExcelForEachRow", "ForEachFileX", "ForEachFolderX", "InterruptibleWhile"]);
+
+/** One fingerprint per package, stable for other tools (schema "automation-index/fingerprint@SCHEMA_VERSION"). */
+function fingerprint(db, pkg, ver) {
+  const k = db.objects("SELECT * FROM package WHERE package_id=? AND version=?", pkg, ver)[0];
+  const vals = (kinds, extra = "") => [...new Set(db.rows(`SELECT normalized FROM v_edge_all WHERE root_package_id=? AND root_version=? AND kind IN (${kinds.map(() => "?").join(",")})
+    AND normalized <> '<dynamic>' AND confidence <> 'low' ${extra} ORDER BY normalized`, pkg, ver, ...kinds).map((r) => r[0]))];
+  const counts = Object.fromEntries(db.rows("SELECT activity, sum(count) FROM activity_use WHERE package_id=? AND version=? GROUP BY activity ORDER BY 2 DESC, 1", pkg, ver));
+  const sum = (set) => Object.entries(counts).filter(([a]) => set.has(a)).reduce((t, [, n]) => t + n, 0);
+  const procs = db.objects("SELECT key, name, folder_path FROM process WHERE package_id=? AND version=?", pkg, ver);
+  const keys = procs.map((p) => p.key);
+  const links = (col, other) => keys.length ? db.objects(`SELECT ${other}_name AS automation, via, resource FROM process_link WHERE ${col} IN (${keys.map(() => "?").join(",")}) ORDER BY 1`, ...keys) : [];
+  const summary = db.one("SELECT text, model, source_sha256 = ?, review IS NOT NULL FROM ai_summary WHERE package_id=? AND version=?", k.sha256, pkg, ver);
+  return {
+    schema: `automation-index/fingerprint@${SCHEMA_VERSION}`,
+    package_id: pkg, version: ver, kind: k.kind, origin: k.origin, description: k.description ?? null,
+    processes: procs.map((p) => ({ key: p.key, name: p.name, folder: p.folder_path })),
+    framework: k.framework ?? null, target_framework: k.target_framework ?? null, studio_version: k.studio_version ?? null,
+    expression_language: k.expression_language ?? null, has_sources: !!k.has_sources, layout: k.layout,
+    coverage: db.rows("SELECT stage || ':' || status FROM coverage WHERE package_id=? AND version=? AND stage NOT LIKE 'config:%'", pkg, ver).map((r) => r[0]),
+    entry_points: db.rows("SELECT DISTINCT path FROM entry_point WHERE package_id=? AND version=? ORDER BY path", pkg, ver).map((r) => r[0]),
+    workflows: db.one("SELECT count(*) FROM workflow WHERE package_id=? AND version=? AND kind <> 'compiled'", pkg, ver)[0],
+    activity_counts: counts,
+    complexity: { decisions: sum(DECISIONS), try_catch: sum(EXCEPTIONS), retries: sum(RETRIES), loops: sum(LOOPS), human_tasks: sum(HITL) },
+    applications: vals(["uses_application"]), hosts: vals(["targets_url", "calls_api"]),
+    assets: vals(["reads_asset", "writes_asset"]), credentials: vals(["reads_credential", "writes_credential"]),
+    queues: { writes: vals(["uses_queue"], "AND detail LIKE '%mode=add%'"), reads: vals(["uses_queue"], "AND detail LIKE '%mode=get%'") },
+    buckets: vals(["uses_bucket"]), invokes_processes: vals(["invokes_process"]), connections: vals(["uses_connection"]),
+    databases: vals(["uses_database"]), email_domains: vals(["sends_email_to_domain"]),
+    libraries: db.objects("SELECT dep_name AS name, dep_spec AS spec FROM dependency WHERE package_id=? AND version=? AND is_activity_pack=0 ORDER BY 1", pkg, ver),
+    activity_packages: db.objects("SELECT dep_name AS name, dep_spec AS spec FROM dependency WHERE package_id=? AND version=? AND is_activity_pack=1 ORDER BY 1", pkg, ver),
+    upstream: links("to_key", "from"), downstream: links("from_key", "to"),
+    findings: db.objects("SELECT rule, severity, subject FROM finding WHERE package_id=? AND version=? ORDER BY rule", pkg, ver),
+    summary: summary ? { text: summary[0], model: summary[1], current: !!summary[2], reviewed: !!summary[3], authoritative: false } : null,
+  };
+}
+
+function cmdExport(a) {
+  const db = connect(a.indexDir);
+  const rows = db.rows("SELECT package_id, version FROM package ORDER BY package_id, version").filter((r) => !a.package || fnmatch(r[0], a.package));
+  const lines = rows.map(([pkg, ver]) => JSON.stringify(fingerprint(db, pkg, ver)));
+  const out = lines.join("\n") + (lines.length ? "\n" : "");
+  if (a.out) {
+    fs.writeFileSync(a.out, out, "utf8");
+    console.log(`${lines.length} fingerprints written to ${a.out}`);
+  } else {
+    process.stdout.write(out);
+  }
 }
 
 // ---------------------------------------------------------------------------- CLI
@@ -3233,7 +3392,13 @@ const COMMANDS = {
     fn: cmdSummary,
     positional: "action",
     positionalChoices: ["set", "list"],
-    options: { package: { type: "string" }, version: { type: "string" }, model: { type: "string" }, file: { type: "string" } },
+    options: { package: { type: "string" }, version: { type: "string" }, model: { type: "string" }, file: { type: "string", help: "the summary (Markdown)" },
+      review: { type: "string", help: "the claim-by-claim review; required (see references/summary-review.md)" } },
+  },
+  export: {
+    help: "write one JSON fingerprint per package (JSON Lines), for other tools",
+    fn: cmdExport,
+    options: { out: { type: "string", help: "file to write (default: stdout)" }, package: { type: "string", help: "glob on package id" } },
   },
 };
 

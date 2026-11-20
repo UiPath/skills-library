@@ -988,3 +988,104 @@ else ok([]);`);
     assert.equal(m.parseXml(decl).text, "\u00c3\u00a9");
   });
 });
+
+describe("process topology, reviewed summaries and fingerprints", () => {
+  let tmp, ix, db;
+  const act = (body) => `<Activity ${NS}><Sequence sap2010:WorkflowViewState.IdRef="S1">${body}</Sequence></Activity>`;
+  before(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-topo-"));
+    const repo = path.join(tmp, "repo");
+    const proj = (dir, name, main, extra = {}) => {
+      write(path.join(repo, dir, "project.json"), JSON.stringify({ name, main: "Main.xaml", ...extra }));
+      write(path.join(repo, dir, "Main.xaml"), main);
+    };
+    proj("Dispatcher", "Dispatcher", act(`<ui:AddQueueItem QueueName="Orders" sap2010:WorkflowViewState.IdRef="Q1"/>
+      <ui:AddQueueItem QueueName="Audit" sap2010:WorkflowViewState.IdRef="Q2"/>
+      <ui:InvokeProcess ProcessName="Reporter" sap2010:WorkflowViewState.IdRef="P1"/>
+      <If sap2010:WorkflowViewState.IdRef="If_1"/><If sap2010:WorkflowViewState.IdRef="If_2"/>
+      <TryCatch sap2010:WorkflowViewState.IdRef="TryCatch_1"/><ui:CreateFormTask sap2010:WorkflowViewState.IdRef="T1"/>`));
+    proj("Performer", "Performer", act(`<ui:GetTransactionItem QueueType="Orders" sap2010:WorkflowViewState.IdRef="G1"/>
+      <ui:GetQueueItem QueueName="Inbound" sap2010:WorkflowViewState.IdRef="G2"/>`));
+    proj("Reporter", "Reporter", act('<ui:GetRobotAsset AssetName="ReportPath" sap2010:WorkflowViewState.IdRef="A1"/>'));
+    for (const f of ["InitAllSettings", "GetTransactionData", "SetTransactionStatus"]) write(path.join(repo, "Performer", "Framework", `${f}.xaml`), act(""));
+    // a Flow package calling the Dispatcher through its bindings
+    fs.mkdirSync(path.join(tmp, "pk"), { recursive: true });
+    nupkg(path.join(tmp, "pk", "flow.nupkg"), "Orders.Flow", "1.0.0", {
+      "OrdersFlow.bpmn": "<definitions/>",
+      "bindings_v2.json": JSON.stringify({ version: "2.0", resources: [{ resource: "process", key: "Shared.Dispatcher",
+        value: { name: { defaultValue: "Dispatcher" }, folderPath: { defaultValue: "Shared" } }, metadata: { ActivityName: "Start dispatcher" } }] }),
+    });
+    ix = path.join(tmp, "ix");
+    let r = run(ix, "extract", "--source", repo, "--nupkg", path.join(tmp, "pk"));
+    assert.equal(r.status, 0, r.stderr);
+    const w = openDb(ix);
+    let n = 0;
+    for (const { package_id, version } of w.prepare("SELECT package_id, version FROM package").all()) {
+      const name = package_id === "Orders.Flow" ? "OrdersFlow" : package_id;
+      w.prepare("INSERT INTO process VALUES (?,?,'f1','Shared',?,?,'Process',NULL,NULL,1,0,NULL,'[]',NULL,NULL)").run(`K${++n}`, name, package_id, version);
+    }
+    w.prepare("INSERT OR REPLACE INTO meta VALUES ('inventory_process_ok', '1')").run();
+    w.close();
+    r = run(ix, "review");
+    assert.equal(r.status, 0, r.stderr);
+    db = openDb(ix);
+  });
+
+  const nameOf = (key) => db.prepare("SELECT name FROM process WHERE key=?").get(key).name;
+
+  test("links: queue handover, process call, and a Flow calling RPA through bindings", () => {
+    const links = db.prepare("SELECT from_key, to_key, via, resource FROM v_process_link").all().map((l) => `${nameOf(l.from_key)} -${l.via}:${l.resource}-> ${nameOf(l.to_key)}`).sort();
+    assert.deepEqual(links, ["Dispatcher -process:reporter-> Reporter", "Dispatcher -queue:orders-> Performer", "OrdersFlow -process:dispatcher-> Dispatcher"]);
+  });
+
+  test("queue handover gaps are findings", () => {
+    const f = Object.fromEntries(db.prepare("SELECT rule, group_concat(subject) s FROM finding WHERE rule LIKE 'AI-LNK-%' GROUP BY rule").all().map((r) => [r.rule, r.s]));
+    assert.equal(f["AI-LNK-001"], "audit");
+    assert.equal(f["AI-LNK-002"], "inbound");
+  });
+
+  test("cards show upstream and downstream automations", () => {
+    assert.equal(run(ix, "cards").status, 0);
+    const card = fs.readFileSync(path.join(ix, "cards", fs.readdirSync(path.join(ix, "cards")).find((f) => f.endsWith("__Dispatcher.md"))), "utf8");
+    assert.match(card, /upstream \(feeds this\) \| OrdersFlow \| process/);
+    assert.match(card, /downstream \(fed by this\) \| Performer \| queue \| orders/);
+  });
+
+  test("a summary is stored only after every claim is reviewed as supported", () => {
+    const pkg = db.prepare("SELECT package_id, version FROM package WHERE package_id='Dispatcher'").get();
+    const sum = path.join(tmp, "s.md");
+    fs.writeFileSync(sum, "Dispatches orders to a queue and starts the reporter.");
+    const rev = path.join(tmp, "r.md");
+    const set = (...extra) => run(ix, "summary", "set", "--package", pkg.package_id, "--version", pkg.version, "--model", "test-model", "--file", sum, ...extra);
+    assert.notEqual(set().status, 0); // no review
+    fs.writeFileSync(rev, "| Claim | Verdict | Evidence |\n|---|---|---|\n| Adds to Orders | SUPPORTED | Main.xaml:1 |\n| Sends email | UNSUPPORTED | none |");
+    let r = set("--review", rev);
+    assert.notEqual(r.status, 0);
+    assert.match(r.stderr, /UNSUPPORTED/);
+    fs.writeFileSync(rev, "| Claim | Verdict | Evidence |\n|---|---|---|\n| Adds to Orders | SUPPORTED | Main.xaml:1 |\n| Starts Reporter | SUPPORTED | Main.xaml:3 |");
+    r = set("--review", rev);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /2 claims checked/);
+  });
+
+  test("export writes one stable fingerprint per package", () => {
+    const r = run(ix, "export");
+    assert.equal(r.status, 0, r.stderr);
+    const fps = Object.fromEntries(r.stdout.trim().split("\n").map((l) => JSON.parse(l)).map((f) => [f.package_id, f]));
+    assert.equal(Object.keys(fps).length, 4);
+    const d = fps.Dispatcher;
+    assert.equal(d.schema, "automation-index/fingerprint@1");
+    assert.deepEqual(d.queues, { writes: ["audit", "orders"], reads: [] });
+    assert.deepEqual(d.invokes_processes, ["reporter"]);
+    assert.equal(d.complexity.decisions, 2);
+    assert.equal(d.complexity.try_catch, 1);
+    assert.equal(d.complexity.human_tasks, 1);
+    assert.equal(d.activity_counts.If, 2);
+    assert.deepEqual(d.downstream.map((x) => x.automation).sort(), ["Performer", "Reporter"]);
+    assert.equal(d.summary.authoritative, false);
+    assert.equal(fps.Performer.framework, "REFramework");
+    assert.deepEqual(fps.Performer.queues.reads, ["inbound", "orders"]);
+    assert.ok(fps["Orders.Flow"].coverage.some((c) => c.startsWith("extract:unsupported")));
+    assert.deepEqual(fps["Orders.Flow"].invokes_processes, ["dispatcher"]);
+  });
+});

@@ -31,7 +31,7 @@ Every edge names its extractor. A `+config` or `+trace` suffix means the value w
 | Package published without sources (common for Studio Web and cross-platform publishing) | `coverage.status = compiled_only`; only bindings, `applicationsMetadata.json`, `project.json` and low-confidence DLL strings | Facts for that automation are partial. Ask the owner for the source repository, then index it with `extract --source` |
 | Value built at runtime (string concatenation, API response, data row) | Edge with `normalized = '<dynamic>'`, the expression kept in `value` | The target is not knowable statically. Show the expression and its file:line |
 | Value read from an asset at runtime | Dynamic edge, detail names the asset | The real value lives in Orchestrator. The index never reads asset values |
-| Agent, Flow, API workflow, app or other non-RPA package | `coverage.status = unsupported` | Out of scope for this version |
+| Agent, Flow, Maestro, API workflow, app or other non-RPA package | `coverage.status = unsupported`; only its `bindings_v2.json` is read (processes it calls, queues, assets, connections) | Its own logic is out of scope; calls declared in a `.flow` file but not in its bindings are not seen |
 | Version ranges in dependencies (`[1.0, 2.0)`) | `dep_version` NULL; the library is not downloaded | The library version the robot loads is decided at runtime |
 | Custom activity packages (compiled code) | Listed in `dependency`, not opened | Behaviour inside them is invisible |
 | Selectors with variables (`{{Title}}`) | Kept as written | The app is still known from the `app` attribute |

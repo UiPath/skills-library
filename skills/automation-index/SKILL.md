@@ -106,13 +106,23 @@ Shape of an answer: the result, the SQL that produced it, evidence for the top r
 
 ### Step 8 (optional): Summaries
 
-When asked to describe what an automation does, read its card and source tree. Write 3–5 lines and store them:
+When asked to describe what an automation does, read its card and source tree and write 3–5 lines. Then review them as a sceptic would: split them into claims and try to disprove each one against the index, following [references/summary-review.md](references/summary-review.md). Correct or drop every claim that is not supported, and store the summary with its review:
 
 ```bash
-node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR summary set --package ID --version V --model MODEL_NAME --file summary.md
+node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR summary set --package ID --version V --model MODEL_NAME --file summary.md --review review.md
 ```
 
-Cards show the summary under "AI summary (non-authoritative)" and mark it stale when the package changes.
+`summary set` refuses a summary without a review, or with any claim marked `UNSUPPORTED` or `CONTRADICTED`.
+
+Cards show the summary under "AI summary (non-authoritative)" with the number of claims checked, and mark it stale when the package changes.
+
+### Step 9 (optional): Hand the index to another tool
+
+```bash
+node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR export --out fingerprints.jsonl
+```
+
+This writes one JSON fingerprint per package (schema `automation-index/fingerprint@1`). Each fingerprint carries identity, framework, activity counts, complexity signals (decisions, try/catch, retries, loops, human tasks), applications, hosts, assets, queues written and read, processes called, libraries, upstream and downstream automations, findings, and the reviewed summary marked non-authoritative. Discovery or migration tools can read it instead of parsing packages again.
 
 ## Examples
 
@@ -123,8 +133,8 @@ Result: two ranked tables plus a coverage line. Low-confidence rows from compile
 
 **Example 2: change impact**
 User says: "The supplier portal login page changes next week. Which automations break?"
-Actions: find the portal's host and executable in `edge`; query `v_process_edge` for those normalized values, including `via` for library paths; add `job_summary` to show which ones actually run.
-Result: affected automations with folder, file, line and activity of every selector, URL or library involved, sorted by run volume.
+Actions: find the portal's host and executable in `edge`; query `v_process_edge` for those normalized values, including `via` for library paths; follow `v_process_link` downstream to the automations they feed through queues or process calls; add `job_summary` to show which ones actually run.
+Result: affected automations with folder, file, line and activity of every selector, URL or library involved, plus the automations downstream of them, sorted by run volume.
 
 **Example 3: robot accounts**
 User says: "How many robot accounts does the Invoice Dispatcher use?"
