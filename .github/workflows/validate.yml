@@ -18,9 +18,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
       - name: Validator tests
         run: npm test
+      # Tests shipped inside skills (scripts/*.test.mjs). Node 22 provides node:sqlite and the
+      # other built-ins those scripts use. Nothing to run when no skill ships tests.
+      - name: Skill script tests
+        run: find skills -path '*/scripts/*.test.mjs' -print0 | sort -z | xargs -0 -r node --test
       # Same command as the guard in publish.yml, so drift fails here, before merge,
       # instead of silently blocking every publish after it.
       - name: Plugin manifests match package.json
