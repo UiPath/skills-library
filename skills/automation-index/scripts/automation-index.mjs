@@ -30,7 +30,7 @@ import { pathToFileURL } from "node:url";
 
 const TOOL_VERSION = "1.0.0";
 // Bump when extraction logic changes; packages indexed by an older extractor are re-read.
-const EXTRACTOR_VERSION = 3;
+const EXTRACTOR_VERSION = 4;
 // Version of the table and export layout other tools read (bumped on incompatible changes).
 const SCHEMA_VERSION = 1;
 const PAGE = 50;
@@ -176,6 +176,11 @@ CREATE TABLE IF NOT EXISTS ai_summary (
   package_id TEXT, version TEXT, model TEXT, text TEXT, source_sha256 TEXT,
   written_at TEXT, review TEXT, reviewed_at TEXT, PRIMARY KEY (package_id, version));
 
+-- Documents shipped with a package or project: PDDs, SDDs, READMEs, agent context files.
+CREATE TABLE IF NOT EXISTS document (
+  package_id TEXT, version TEXT, path TEXT, kind TEXT, format TEXT, bytes INTEGER,
+  sha256 TEXT, template INTEGER, title TEXT, text TEXT);
+
 CREATE TABLE IF NOT EXISTS activity_use (
   package_id TEXT, version TEXT, activity TEXT, count INTEGER);
 
@@ -188,6 +193,7 @@ CREATE TABLE IF NOT EXISTS process_link (
 CREATE INDEX IF NOT EXISTS ix_edge_pkg ON edge (package_id, version, kind, normalized);
 CREATE INDEX IF NOT EXISTS ix_finding_pkg ON finding (package_id, version);
 CREATE INDEX IF NOT EXISTS ix_activity_pkg ON activity_use (package_id, version);
+CREATE INDEX IF NOT EXISTS ix_document_pkg ON document (package_id, version);
 CREATE INDEX IF NOT EXISTS ix_link_from ON process_link (from_key);
 CREATE INDEX IF NOT EXISTS ix_link_to ON process_link (to_key);
 CREATE INDEX IF NOT EXISTS ix_entry_pkg ON entry_point (package_id, version);
@@ -1254,7 +1260,8 @@ class PackageExtractor {
     this.workflows = [];
     this.argBindings = []; // [caller file, target raw, argument name, Val, ctx]
     this.varSources = new Map();
-    this.activityUse = new Map(); // activity type -> count (fingerprint and complexity signals) // "file\0variable" -> [["val", Val, line] | ["asset", name, line]]
+    this.activityUse = new Map(); // activity type -> count (fingerprint and complexity signals)
+    this.disabled = 0; // activities inside Comment Out blocks // "file\0variable" -> [["val", Val, line] | ["asset", name, line]]
   }
 
   edge(kind, value, ctx, normalized = null, detail = null, stat = true, extractor = "xaml", confidence = "high") {
@@ -1336,6 +1343,11 @@ class PackageExtractor {
     const stack = [[root, { file: rel, line: root.line, activity: activityPrefix, activity_type: null }]];
     while (stack.length) {
       const [node, parentCtx] = stack.pop();
+      if (node.local === "CommentOut") {
+        // Studio's Comment Out disables everything inside it: not run, so no facts, calls or counts from it.
+        this.disabled += [...iterNodes(node)].filter((x) => x !== node && x.attrs["WorkflowViewState.IdRef"]).length;
+        continue;
+      }
       const idref = node.attrs["WorkflowViewState.IdRef"];
       let ctx;
       const secretProp = node.local.includes(".") && SECRET_ATTRS.has(node.local.split(".").pop()) ? node.local : null;
@@ -1460,6 +1472,22 @@ class PackageExtractor {
       }
     }
     if (MAIL_SERVER.has(L)) this.valueEdge("uses_mail_server", firstProp(n, "Server", "Host"), ctx, extractor, L);
+    if (typeof n.attrs.Configuration === "string" && n.attrs.Configuration.startsWith("H4sI")) {
+      // ConnectorActivity keeps connector, object and operation in a gzip+base64 JSON blob.
+      // Only these fields are read; cached lookup values and schemas can hold sample data.
+      const cfg = decodeConnectorConfig(n.attrs.Configuration);
+      if (cfg) {
+        const inst = isObject(cfg.InstanceParameters) ? cfg.InstanceParameters : {};
+        const connector = String(inst.ConnectorKey || n.attrs.ConnectorKey || "").trim();
+        const object = String(cfg.ObjectName || "").trim();
+        const operation = String(cfg.Operation || "").trim();
+        if (connector || object || operation) {
+          const value = [connector || "?", operation || "?", object || "?"].join(" ");
+          const det = [cfg.HttpMethod && `method=${cfg.HttpMethod}`, cfg.Path && `path=${cfg.Path}`, cfg.LocalizedActivityName && `activity=${cfg.LocalizedActivityName}`].filter(Boolean).join("; ");
+          this.edge("uses_connector_operation", value, ctx, value.toLowerCase(), det || null, true, extractor, "high");
+        }
+      }
+    }
     if ("ConnectionId" in n.attrs || "ConnectorKey" in n.attrs) {
       const conn = n.attrs.ConnectorKey || n.attrs.Connector || L;
       const det = ["ConnectionName", "ConnectionAccountName", "ConnectionId", "ObjectName", "Operation"]
@@ -1985,7 +2013,7 @@ function writeTree(indexDir, pkg, ver, files) {
 }
 
 function deletePackageRows(db, pkg, ver) {
-  for (const t of ["edge", "invocation", "workflow", "dependency", "entry_point", "config_key", "binding", "analyzer_run", "analyzer_finding", "finding", "activity_use"]) {
+  for (const t of ["edge", "invocation", "workflow", "dependency", "entry_point", "config_key", "binding", "analyzer_run", "analyzer_finding", "finding", "activity_use", "document"]) {
     db.run(`DELETE FROM ${t} WHERE package_id=? AND version=?`, pkg, ver);
   }
   db.run("DELETE FROM coverage WHERE package_id=? AND version=? AND stage LIKE 'config:%'", pkg, ver);
@@ -2020,6 +2048,74 @@ function pyScalar(v) {
 
 const BINDING_KINDS = { asset: "reads_asset", queue: "uses_queue", process: "invokes_process", bucket: "uses_bucket",
   connection: "uses_connection", eventtrigger: "uses_connection", app: "uses_app", index: "uses_context_index" };
+
+function decodeConnectorConfig(b64) {
+  try {
+    const raw = zlib.gunzipSync(Buffer.from(b64, "base64"), { maxOutputLength: 8 * 1024 * 1024 });
+    const j = JSON.parse(raw.toString("utf8"));
+    return isObject(j) ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------- documents shipped with automations
+
+const DOC_EXT = /\.(pdf|docx|doc|pptx|vsdx|md|markdown|txt|rtf)$/i;
+const TEMPLATE_DOCS = [/^REFramework documentation/i, /^Document Understanding Process - User Guide/i];
+
+function documentKind(rel, text) {
+  const name = posixBasename(rel).toLowerCase();
+  const hay = (name + " " + (text || "").slice(0, 3000)).toLowerCase();
+  if (/^(agents|claude)\.md$/.test(name) || /\.claude\/rules\//i.test(rel)) return "agent_context";
+  if (/^readme/.test(name)) return "readme";
+  if (/\bpdd\b|process (definition|design) document|pdd[._ -]/.test(hay)) return "pdd";
+  if (/\bsdd\b|solution design|technical documentation|design document|sdd[._ -]/.test(hay)) return "sdd";
+  if (/deployment guide|runbook|user guide|operations guide|installation/.test(hay)) return "runbook";
+  return "other";
+}
+
+/** Plain text of a .docx (paragraphs from word/document.xml), or null. */
+function docxText(buf) {
+  try {
+    const z = new Zip(buf);
+    const root = parseXml(z.read("word/document.xml"), { maxNodes: 2 * 1000 * 1000 });
+    const paras = [];
+    for (const n of iterNodes(root)) {
+      if (n.local !== "p") continue;
+      const t = [...iterNodes(n)].filter((x) => x.local === "t").map((x) => x.text).join("");
+      if (t.trim()) paras.push(t.trim());
+    }
+    return paras.join("\n");
+  } catch {
+    return null;
+  }
+}
+
+/** Catalogue the documents a package or project ships: kind, template or not, and text where it can be read. */
+function catalogDocuments(db, pkg, ver, files) {
+  let n = 0;
+  for (const rel of [...files.keys()].sort()) {
+    const lower = rel.toLowerCase();
+    if (!DOC_EXT.test(lower) || lower.startsWith(".local/") || lower.startsWith(".tmh/")) continue;
+    const name = posixBasename(rel);
+    const inDocs = /(^|\/)(documentation|docs)\//i.test(rel);
+    const notable = /^(readme|agents\.md|claude\.md)/i.test(name) || /\.claude\/rules\/.+\.md$/i.test(rel) ||
+      /(pdd|sdd|process (definition|design)|solution design)/i.test(name);
+    if (!inDocs && !notable) continue;
+    const data = files.get(rel);
+    const format = lower.split(".").pop();
+    let text = null;
+    if (["md", "markdown", "txt"].includes(format)) text = new TextDecoder("utf-8").decode(data).replace(/^\uFEFF/, "");
+    else if (format === "docx") text = docxText(data);
+    const template = TEMPLATE_DOCS.some((re) => re.test(name)) ? 1 : 0;
+    const title = (text && text.split(/\r?\n/).map((l) => l.replace(/^#+\s*/, "").trim()).find(Boolean)) || name;
+    db.run("INSERT INTO document VALUES (?,?,?,?,?,?,?,?,?,?)", pkg, ver, rel, template ? "template" : documentKind(rel, text), format,
+      data.length, sha256(data), template, cut(title, 200), text === null ? null : cut(text, 200 * 1000));
+    n++;
+  }
+  return n;
+}
 
 /** Resources a package declares in bindings_v2.json: assets, queues, processes it calls, connections. */
 function readBindings(db, ex, pkg, ver, files) {
@@ -2070,6 +2166,7 @@ function extractOne(db, indexDir, p, kind = "process", origin = "download", forc
     // Maestro, Flow and agent packages: workflows are not read, but their bindings name the processes they call.
     const ex = new PackageExtractor(db, pid, ver, p, new Map());
     const bound = readBindings(db, ex, pid, ver, files);
+    catalogDocuments(db, pid, ver, files);
     ex.flush();
     coverage(db, pid, ver, "extract", "unsupported", "no project.json found (agent, flow, app or other package type)" +
       (bound ? `; ${bound} resource bindings read (processes it calls, queues, assets, connections)` : ""));
@@ -2202,6 +2299,7 @@ function extractOne(db, indexDir, p, kind = "process", origin = "download", forc
 
   // Package bindings (present even in compiled-only packages).
   readBindings(db, ex, pkg, ver, files);
+  catalogDocuments(db, pkg, ver, files);
 
   if (!hasSources) for (const [rel, data] of info.dlls) ex.dllStrings(rel, data, pj.name ?? null);
 
@@ -2248,12 +2346,13 @@ function extractOne(db, indexDir, p, kind = "process", origin = "download", forc
   }
 
   writeTree(indexDir, pkg, ver, files);
+  const disabledNote = ex.disabled ? `; ${ex.disabled} activities inside Comment Out blocks ignored (disabled code)` : "";
   const skippedNote = info.skipped && info.skipped.length
     ? `; ${info.skipped.length} file(s) over ${MAX_FILE_BYTES} bytes not read: ${info.skipped.slice(0, 5).join(", ")}${info.skipped.length > 5 ? ", ..." : ""}` : "";
   coverage(db, pkg, ver, "extract", pjError || skippedNote ? "partial" : hasSources ? "indexed" : "compiled_only",
     (pjError ? `${pjError}; dependencies, entry points and project settings unknown; ${sources.length} source files read`
       : hasSources ? `${sources.length} source files`
-      : "no .xaml/.cs in package (published without sources); facts limited to project.json, bindings, applicationsMetadata and low-confidence DLL strings") + skippedNote);
+      : "no .xaml/.cs in package (published without sources); facts limited to project.json, bindings, applicationsMetadata and low-confidence DLL strings") + skippedNote + disabledNote);
   return [pkg, ver];
 }
 
@@ -2384,7 +2483,7 @@ function cmdCrawl(a) {
   }
   setMeta(db, "inventory_process_ok", procs !== null ? "1" : "0");
   if (folderList === null) {
-    // Folder discovery failed: keep every folder we knew, so their resources are still crawled and kept.
+    // Folder listing failed: keep every folder we knew, so their resources are still crawled and kept.
     for (const [k, p, t, ft, src] of db.rows("SELECT key, path, type, feed_type, source FROM folder")) if (!folders.has(k)) folders.set(k, [p, t, ft, src]);
   }
   db.run("DELETE FROM folder");
@@ -2809,6 +2908,12 @@ const RULES = [
      FROM analyzer_finding f WHERE f.level IN ('Error','Critical')`)],
   ["AI-WA-002", "Info", "Workflow Analyzer could not run on this package", (db) => db.rows(
     "SELECT package_id, version, NULL, status, detail, NULL FROM analyzer_run WHERE status <> 'ok'")],
+  ["AI-DOC-001", "Info", "Deployed automation ships no project documentation", (db) => db.rows(
+    `SELECT p.package_id, p.version, group_concat(DISTINCT p.key), min(p.name),
+            'no PDD, SDD, README or agent context file in the package; template documents do not count', NULL
+     FROM process p JOIN package k ON k.package_id = p.package_id AND k.version = p.version
+     WHERE k.kind <> 'other' AND NOT EXISTS (SELECT 1 FROM document d WHERE d.package_id = p.package_id AND d.version = p.version AND d.template = 0)
+     GROUP BY p.package_id, p.version`)],
   ["AI-LNK-001", "Info", "Queue written by an automation but read by none of the indexed automations", (db) => queueHandoverRule(db, "add")],
   ["AI-LNK-002", "Info", "Queue read by an automation but written by none of the indexed automations", (db) => queueHandoverRule(db, "get")],
   ["AI-GOV-001", "Critical", "Application or URL outside the restriction list", (db, ctx) => restrictionRule(db, ctx)],
@@ -3065,6 +3170,12 @@ function cardFor(db, pkg, ver, proc = null) {
     }
     out.push("");
   }
+  const docs = db.rows("SELECT path, kind, format, template, title FROM document WHERE package_id=? AND version=? ORDER BY template, kind, path", pkg, ver);
+  if (docs.length) {
+    out.push("## Documentation\n\nAuthor-written intent: use it for purpose and context, and check every claim against the facts above.\n\n| Kind | Document | Format | Title |\n|---|---|---|---|");
+    for (const [pth, kind, fmt, tpl, title] of docs) out.push(`| ${tpl ? "template (not project-specific)" : kind} | ${md(pth)} | ${fmt} | ${md(title)} |`);
+    out.push("");
+  }
   const deps = db.rows(`SELECT dep_name, dep_spec, is_activity_pack, (SELECT status FROM coverage c WHERE c.package_id=d.dep_name
       AND c.version=d.dep_version AND c.stage='extract') FROM dependency d WHERE package_id=? AND version=? ORDER BY is_activity_pack, dep_name`, pkg, ver);
   if (deps.length) {
@@ -3319,6 +3430,9 @@ function fingerprint(db, pkg, ver) {
     queues: { writes: vals(["uses_queue"], "AND detail LIKE '%mode=add%'"), reads: vals(["uses_queue"], "AND detail LIKE '%mode=get%'") },
     buckets: vals(["uses_bucket"]), invokes_processes: vals(["invokes_process"]), connections: vals(["uses_connection"]),
     databases: vals(["uses_database"]), email_domains: vals(["sends_email_to_domain"]),
+    connector_operations: vals(["uses_connector_operation"]),
+    documents: db.objects("SELECT path, kind, format, template FROM document WHERE package_id=? AND version=? ORDER BY path", pkg, ver)
+      .map((d) => ({ ...d, template: !!d.template })),
     libraries: db.objects("SELECT dep_name AS name, dep_spec AS spec FROM dependency WHERE package_id=? AND version=? AND is_activity_pack=0 ORDER BY 1", pkg, ver),
     activity_packages: db.objects("SELECT dep_name AS name, dep_spec AS spec FROM dependency WHERE package_id=? AND version=? AND is_activity_pack=1 ORDER BY 1", pkg, ver),
     upstream: links("to_key", "from"), downstream: links("from_key", "to"),

@@ -944,7 +944,7 @@ else ok([]);`);
     assert.ok(f.some((x) => x.rule === "AI-RES-003" && x.subject === "Traced_Q" && /Elsewhere/.test(x.detail)), JSON.stringify(f));
   });
 
-  test("R8 a Project.JSON source folder is discovered", () => {
+  test("R8 a Project.JSON source folder is found", () => {
     const d = path.join(tmp, "r8");
     write(path.join(d, "repo", "P", "Project.JSON"), JSON.stringify({ name: "Upper", main: "Main.xaml" }));
     write(path.join(d, "repo", "P", "Main.xaml"), SIMPLE.replace("ASSET_NAME", "A"));
@@ -1087,5 +1087,82 @@ describe("process topology, reviewed summaries and fingerprints", () => {
     assert.deepEqual(fps.Performer.queues.reads, ["inbound", "orders"]);
     assert.ok(fps["Orders.Flow"].coverage.some((c) => c.startsWith("extract:unsupported")));
     assert.deepEqual(fps["Orders.Flow"].invokes_processes, ["dispatcher"]);
+  });
+});
+
+describe("disabled code, shipped documents, connector operations", () => {
+  let tmp, ix, db;
+  const NSX = NS + ' xmlns:isactr="http://schemas.uipath.com/workflow/integration-service-activities/isactr"';
+  const docx = (paras) => zip([["word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>' +
+    paras.map((p) => `<w:p><w:r><w:t>${p}</w:t></w:r></w:p>`).join("") + "</w:body></w:document>"]]);
+  before(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-docs-"));
+    const repo = path.join(tmp, "repo");
+    const cfg = zlib.gzipSync(Buffer.from(JSON.stringify({ InstanceParameters: { ConnectorKey: "uipath-salesforce-sfdc" }, ObjectName: "Account",
+      Operation: "Create", HttpMethod: "POST", Path: "/Account", CachedLookupValues: { ObjectName: [{ Id: "SampleCustomerRecord" }] } }))).toString("base64");
+    write(path.join(repo, "P", "project.json"), JSON.stringify({ name: "P", main: "Main.xaml" }));
+    write(path.join(repo, "P", "Main.xaml"), `<Activity ${NSX}><Sequence sap2010:WorkflowViewState.IdRef="S1">
+      <ui:CommentOut sap2010:WorkflowViewState.IdRef="C1"><ui:CommentOut.Body><Sequence sap2010:WorkflowViewState.IdRef="S2">
+        <ui:InvokeWorkflowFile WorkflowFileName="Old.xaml" sap2010:WorkflowViewState.IdRef="I1"/>
+        <ui:GetRobotAsset AssetName="Disabled_Asset" sap2010:WorkflowViewState.IdRef="G1"/>
+      </Sequence></ui:CommentOut.Body></ui:CommentOut>
+      <ui:GetRobotAsset AssetName="Live_Asset" sap2010:WorkflowViewState.IdRef="G2"/>
+      <isactr:ConnectorActivity Configuration="${cfg}" ConnectionId="c-1" sap2010:WorkflowViewState.IdRef="CA1"/>
+    </Sequence></Activity>`);
+    write(path.join(repo, "P", "Old.xaml"), SIMPLE.replace("ASSET_NAME", "Old_Asset"));
+    write(path.join(repo, "P", "README.md"), "# Invoice dispatcher\n\nReads invoices and adds queue items.");
+    write(path.join(repo, "P", "AGENTS.md"), "# Project context\n");
+    fs.mkdirSync(path.join(repo, "P", "Documentation"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "P", "Documentation", "REFramework Documentation-EN.pdf"), "%PDF-1.4 template");
+    fs.writeFileSync(path.join(repo, "P", "Documentation", "PDD_Invoices_v1.docx"), docx(["Process Definition Document", "Applications Used", "SAP GUI", "Service account Password=Zq7Secret"]));
+    write(path.join(repo, "Bare", "project.json"), JSON.stringify({ name: "Bare", main: "Main.xaml" }));
+    write(path.join(repo, "Bare", "Main.xaml"), SIMPLE.replace("ASSET_NAME", "Bare_Asset"));
+    ix = path.join(tmp, "ix");
+    let r = run(ix, "extract", "--source", repo);
+    assert.equal(r.status, 0, r.stderr);
+    const w = openDb(ix);
+    let n = 0;
+    for (const { package_id, version } of w.prepare("SELECT package_id, version FROM package").all()) {
+      w.prepare("INSERT INTO process VALUES (?,?,'f1','Shared',?,?,'Process',NULL,NULL,1,0,NULL,'[]',NULL,NULL)").run(`K${++n}`, package_id, package_id, version);
+    }
+    w.close();
+    r = run(ix, "review");
+    assert.equal(r.status, 0, r.stderr);
+    db = openDb(ix);
+  });
+
+  test("code inside Comment Out is ignored: no facts, no calls, unreachable target", () => {
+    const assets = db.prepare("SELECT normalized FROM edge WHERE package_id='P' AND kind='reads_asset' AND file='Main.xaml'").all().map((r) => r.normalized);
+    assert.deepEqual(assets, ["live_asset"]);
+    assert.equal(db.prepare("SELECT count(*) n FROM invocation WHERE package_id='P'").get().n, 0);
+    assert.equal(db.prepare("SELECT reachable FROM workflow WHERE package_id='P' AND path='Old.xaml'").get().reachable, 0);
+    assert.equal(db.prepare("SELECT count(*) n FROM activity_use WHERE package_id='P' AND activity='InvokeWorkflowFile'").get().n, 0);
+    assert.match(db.prepare("SELECT detail FROM coverage WHERE package_id='P' AND stage='extract'").get().detail, /3 activities inside Comment Out/);
+  });
+
+  test("shipped documents are catalogued, templates recognised, docx text read and scrubbed", () => {
+    const docs = Object.fromEntries(db.prepare("SELECT path, kind, template, text FROM document WHERE package_id='P'").all().map((d) => [d.path, d]));
+    assert.equal(docs["README.md"].kind, "readme");
+    assert.equal(docs["AGENTS.md"].kind, "agent_context");
+    assert.equal(docs["Documentation/REFramework Documentation-EN.pdf"].template, 1);
+    assert.equal(docs["Documentation/PDD_Invoices_v1.docx"].kind, "pdd");
+    assert.match(docs["Documentation/PDD_Invoices_v1.docx"].text, /Applications Used\nSAP GUI/);
+    assert.ok(!docs["Documentation/PDD_Invoices_v1.docx"].text.includes("Zq7Secret"));
+    const f = db.prepare("SELECT group_concat(subject) s FROM finding WHERE rule='AI-DOC-001'").get().s;
+    assert.equal(f, "Bare");
+    assert.equal(run(ix, "cards").status, 0);
+    const card = fs.readFileSync(path.join(ix, "cards", fs.readdirSync(path.join(ix, "cards")).find((x) => x.endsWith("__P.md"))), "utf8");
+    assert.match(card, /## Documentation/);
+    assert.match(card, /template \(not project-specific\)/);
+  });
+
+  test("connector configuration gives connector, operation and object, never cached values", () => {
+    const e = db.prepare("SELECT value, detail FROM edge WHERE kind='uses_connector_operation'").get();
+    assert.equal(e.value, "uipath-salesforce-sfdc Create Account");
+    assert.match(e.detail, /method=POST; path=\/Account/);
+    assert.equal(db.prepare("SELECT count(*) n FROM edge WHERE value LIKE '%SampleCustomerRecord%' OR detail LIKE '%SampleCustomerRecord%'").get().n, 0);
+    const fp = JSON.parse(run(ix, "export", "--package", "P").stdout);
+    assert.deepEqual(fp.connector_operations, ["uipath-salesforce-sfdc create account"]);
+    assert.ok(fp.documents.some((d) => d.kind === "pdd"));
   });
 });

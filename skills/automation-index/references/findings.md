@@ -19,6 +19,7 @@ The `review` command clears the `finding` table and rebuilds it from the index. 
 | AI-SRC-003 | Warning | Workflow file could not be parsed | Malformed XML |
 | AI-WA-001 | Warning | Workflow Analyzer errors in the deployed package | From `uip rpa analyze` against the tenant's published policy or the supplied policy file. Reported verbatim |
 | AI-WA-002 | Info | Workflow Analyzer could not run on this package | Usually a Windows-target project on a non-Windows host |
+| AI-DOC-001 | Info | Deployed automation ships no project documentation | No PDD, SDD, README or agent context file in the package; stock framework documents do not count. Documentation may live elsewhere (wiki, document store), so read it as "not in the package" |
 | AI-LNK-001 | Info | Queue written by an automation but read by none of the indexed automations | A broken handover, or a queue read outside UiPath, through a dynamic name, or by a package that could not be read. The detail gives the count of packages not fully read |
 | AI-LNK-002 | Info | Queue read by an automation but written by none of the indexed automations | Items fed from outside UiPath (API, other systems) or by an automation that is not indexed |
 | AI-GOV-001 | Critical | Application or URL outside the restriction list | Only with `--restrictions FILE` |

@@ -36,6 +36,7 @@ node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT 
 | `edge` | fact: the automation touches something | see below |
 | `config_key` | Config.xlsx / config JSON key | `sheet`, `name`, `value` (credential-like values redacted), `redacted` |
 | `binding` | resource in `bindings_v2.json`, also read from Maestro, Flow and agent packages | `resource`, `name`, `folder_path` |
+| `document` | document shipped with a package or project | `path`, `kind` (pdd, sdd, readme, agent_context, runbook, template, other), `format`, `template` (1 for stock framework documents), `title`, `text` (Markdown, text and .docx; PDFs are read directly from the source tree) |
 | `activity_use` | activity type per package | `activity` (Studio type name, such as `If`, `TryCatch`, `NClick`), `count` |
 
 ### From analysis and review
@@ -64,7 +65,7 @@ node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT 
 
 There is one row per distinct value per activity. Where there is no activity (coded workflow lines, Config rows, DLL strings), there is one row per value per line. Values are scrubbed of credential material before they are stored.
 
-Edge kinds: `uses_application`, `targets_url`, `calls_api`, `reads_asset`, `writes_asset`, `reads_credential`, `writes_credential`, `uses_queue` (detail contains `mode=add` or `mode=get`), `uses_bucket`, `invokes_process`, `uses_connection` (Integration Service), `uses_database`, `sends_email_to_domain`, `uses_mail_server`, `runs_code`, `ui_technology` (selector root tag: `wnd`, `html`, `sap`, `java`, `uia`, `citrix`...), `window_title`, `uses_file`, `uses_config_key`, `uses_or_descriptor`, `hardcoded_secret` (value always redacted).
+Edge kinds: `uses_application`, `targets_url`, `calls_api`, `reads_asset`, `writes_asset`, `reads_credential`, `writes_credential`, `uses_queue` (detail contains `mode=add` or `mode=get`), `uses_bucket`, `invokes_process`, `uses_connection` (Integration Service), `uses_connector_operation` (connector, operation and object from the activity's configuration, e.g. `uipath-salesforce-sfdc Create Account`), `uses_database`, `sends_email_to_domain`, `uses_mail_server`, `runs_code`, `ui_technology` (selector root tag: `wnd`, `html`, `sap`, `java`, `uia`, `citrix`...), `window_title`, `uses_file`, `uses_config_key`, `uses_or_descriptor`, `hardcoded_secret` (value always redacted).
 
 ## Views
 

@@ -106,7 +106,7 @@ Shape of an answer: the result, the SQL that produced it, evidence for the top r
 
 ### Step 8 (optional): Summaries
 
-When asked to describe what an automation does, read its card and source tree and write 3–5 lines. Then review them as a sceptic would: split them into claims and try to disprove each one against the index, following [references/summary-review.md](references/summary-review.md). Correct or drop every claim that is not supported, and store the summary with its review:
+When asked to describe what an automation does, read its card, its source tree and the documents it ships (the card's Documentation section: PDDs, SDDs, READMEs; read PDFs directly) and write 3–5 lines. Documents are author-written intent: use them for purpose and context, never to add or change a fact, and check every claim against the index. Then review them as a sceptic would: split them into claims and try to disprove each one against the index, following [references/summary-review.md](references/summary-review.md). Correct or drop every claim that is not supported, and store the summary with its review:
 
 ```bash
 node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR summary set --package ID --version V --model MODEL_NAME --file summary.md --review review.md
@@ -122,7 +122,7 @@ Cards show the summary under "AI summary (non-authoritative)" with the number of
 node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR export --out fingerprints.jsonl
 ```
 
-This writes one JSON fingerprint per package (schema `automation-index/fingerprint@1`). Each fingerprint carries identity, framework, activity counts, complexity signals (decisions, try/catch, retries, loops, human tasks), applications, hosts, assets, queues written and read, processes called, libraries, upstream and downstream automations, findings, and the reviewed summary marked non-authoritative. Discovery or migration tools can read it instead of parsing packages again.
+This writes one JSON fingerprint per package (schema `automation-index/fingerprint@1`). Each fingerprint carries identity, framework, activity counts, complexity signals (decisions, try/catch, retries, loops, human tasks), applications, hosts, assets, queues written and read, processes called, libraries, upstream and downstream automations, findings, and the reviewed summary marked non-authoritative. Other tools can read it instead of parsing the packages again.
 
 ## Examples
 
@@ -141,7 +141,12 @@ User says: "How many robot accounts does the Invoice Dispatcher use?"
 Actions: query `job_identity` for the process (crawl must have run with jobs; `--resolve-identities` adds the Orchestrator identity).
 Result: count and list of accounts and machines in the job window, with the window stated.
 
-**Example 4: governance check**
+**Example 4: documentation against code**
+User says: "Does this automation still do what its PDD says?"
+Actions: list its documents (`document` table, kind `pdd`), read the PDD's Applications Used and exception sections, and compare them with `uses_application`, `targets_url` and the workflow facts.
+Result: what the PDD names that the code does not use, and what the code uses that the PDD does not mention, each with evidence. The index facts stay as they are; differences are reported, not resolved.
+
+**Example 5: governance check**
 User says: "Did anything reach production without passing our analyzer rules or using unapproved apps?"
 Actions: `analyze` with the policy, `review --restrictions FILE`, then report AI-WA-001, AI-WA-002 and AI-GOV-001.
 Result: violations with evidence, plus the packages that could not be analyzed and why.

@@ -10,6 +10,7 @@ Every edge names its extractor. A `+config` or `+trace` suffix means the value w
 | `xaml:code` | URLs, Config keys and credential patterns inside Invoke Code / PowerShell bodies | medium |
 | `object_repository`, `object_repository:selector` | `.objects/` screens and elements, labelled with the app / screen / element names | high / medium |
 | `studio_applications_metadata` | `applicationsMetadata.json`, which Studio writes at publish and Orchestrator shows as "used applications" | high |
+| `xaml` connector configuration | The gzip+base64 `Configuration` of Integration Service activities: connector, operation, object, HTTP method and path. Cached lookup values and schemas are never read | high |
 | `package_bindings` | `bindings_v2.json` resources (assets, queues, processes, connections). Present even in compiled packages. | high |
 | `config_assets_sheet` | Rows of the Config **Assets** sheet (REFramework loads every row with Get Asset at start) | medium |
 | `config_file` | Credential-like values stored in Config files (always redacted) | medium |
@@ -36,6 +37,7 @@ Every edge names its extractor. A `+config` or `+trace` suffix means the value w
 | Custom activity packages (compiled code) | Listed in `dependency`, not opened | Behaviour inside them is invisible |
 | Selectors with variables (`{{Title}}`) | Kept as written | The app is still known from the `app` attribute |
 | Malformed XAML | `workflow.parse_error`; finding AI-SRC-003 | Studio may still open it; check the file |
+| Activities inside a Comment Out block | Ignored: no facts, no calls, not counted; the number is noted in coverage | Disabled code does not run |
 | DTD declarations in a file (entities, attribute defaults) | Refused as a parse error; entities are never expanded | Unusual for Studio files; check where the file came from |
 | Files over 50 MB, packages over 1 GB inflated, more than 200,000 zip entries, wrong CRC | The file or package is refused and recorded with the reason | Usually a corrupt or unusual package |
 | `project.json` that is not valid JSON | `coverage.status = partial`: workflows are read, dependencies and entry points are unknown | Fix the file, or treat the automation's library links as unknown |
