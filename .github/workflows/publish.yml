@@ -11,12 +11,6 @@ name: Publish package
 # OIDC trusted publishing with --provenance, so the repo holds no npm token.
 # `npm install @uipath/skills-library` with no tag always resolves the last stable.
 
-# The sprint cut finds the run it dispatched by its request_id.
-run-name: >-
-  ${{ github.event_name == 'workflow_dispatch'
-      && format('Publish {0} from {1} {2}', github.event.inputs.channel, github.ref_name, github.event.inputs.request_id)
-      || format('Publish from {0}', github.ref_name) }}
-
 on:
   push:
     branches: [main, 'release/v*']
@@ -28,14 +22,9 @@ on:
         default: preview
         type: choice
         options: [preview, dev, latest]
-      request_id:
-        description: "Set by the sprint cut to find its own run. Leave empty."
-        required: false
-        default: ""
 
 # One publish per channel at a time, across branches, since the dist-tag is what
-# they share; never cancel one in flight. `dev` is main-only and the sprint cut
-# dispatches only preview, so a push to main never queues behind the cut's run.
+# they share; never cancel one in flight.
 concurrency:
   group: publish-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.channel || (github.ref == 'refs/heads/main' && 'dev' || 'preview') }}
   cancel-in-progress: false

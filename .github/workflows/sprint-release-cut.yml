@@ -11,13 +11,12 @@ name: Sprint Release Cut
 #      when this repo cut release/vM.N on an earlier Sunday and main was never
 #      bumped, instead of re-cutting the old line
 #   2. cuts release/v<M.N> from main at the version ALREADY in main (no bump)
-#   3. dispatches publish.yml with channel=preview (npmjs) on the release branch
-#      and waits for it. The bot's own branch push cannot trigger publish.yml
-#      (GITHUB_TOKEN recursion guard), so the dispatch is explicit. No dev build:
-#      main already published one for this commit, and `dev` tracks main only.
-#      Stable (`latest`) is promoted MANUALLY
-#   4. opens a PR bumping main to the NEXT line (M.(N+1).0), even if step 3
-#      failed, with a warning in the body. The cut never pushes to main.
+#   3. opens a PR bumping main to the NEXT line (M.(N+1).0). The cut never
+#      pushes to main.
+#
+# It publishes nothing. Its push uses GITHUB_TOKEN, which does not trigger
+# publish.yml, so a line's first preview comes from the first merge into its
+# release branch or a manual run. Stable (`latest`) is promoted MANUALLY.
 
 on:
   schedule:
@@ -29,7 +28,7 @@ on:
         required: false
         default: ''
       dry_run:
-        description: 'Print the computed plan without pushing, publishing, or opening a PR'
+        description: 'Print the computed plan without pushing or opening a PR'
         type: boolean
         required: false
         default: false
@@ -37,9 +36,6 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # `gh workflow run publish.yml` needs this; an explicit block sets every
-  # unlisted scope to `none`, and the cut would publish nothing.
-  actions: write
 
 # Cron cannot express "every two Sundays": fire every Sunday, then gate on the
 # 14-day cadence anchor. Must stay equal to UiPath/skills' anchor.
@@ -158,7 +154,6 @@ jobs:
             echo ""
             echo "- current line (main): \`$CURRENT_LINE\`"
             echo "- cut line: \`$CUT_LINE\` — branch \`release/v$CUT_LINE\` @ \`$(git rev-parse --short HEAD)\` at version \`$CUT_LINE.0\`"
-            echo "- would publish (and wait): preview to npmjs — stable stays manual"
             echo "- would open a bump PR: \`main\` -> \`$NEXT_LINE.0\`"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -207,47 +202,11 @@ jobs:
           echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
-      - name: Publish preview from the release branch (wait for success)
-        id: publish
+      - name: Open version-bump PR against main
+        id: mainbump
         if: steps.target.outputs.proceed == 'true' && github.event.inputs.dry_run != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LINE: ${{ steps.target.outputs.cut_line }}
-          VERSION: ${{ steps.cutbranch.outputs.version }}
-          REQUEST_ID: ${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          BRANCH="release/v$LINE"
-          # `gh workflow run` does not return the run id. publish.yml puts the
-          # request_id at the end of its run name, so find the run by that, not by
-          # "newest on the branch", which a manual dispatch could be.
-          echo "Dispatching publish.yml channel=preview on $BRANCH (request $REQUEST_ID)..."
-          gh workflow run publish.yml --ref "$BRANCH" -f channel=preview -f request_id="$REQUEST_ID"
-          run_id=""
-          for _ in $(seq 1 40); do
-            sleep 6
-            run_id=$(gh run list --workflow publish.yml --branch "$BRANCH" --event workflow_dispatch \
-              --limit 20 --json databaseId,displayTitle \
-              --jq "map(select(.displayTitle == \"Publish preview from $BRANCH $REQUEST_ID\")) | .[0].databaseId // empty")
-            [ -n "$run_id" ] && break
-          done
-          if [ -z "$run_id" ]; then
-            echo "::error::Timed out finding the dispatched publish.yml run (request $REQUEST_ID)."
-            exit 1
-          fi
-          echo "Watching publish.yml run $run_id..."
-          gh run watch "$run_id" --exit-status --interval 15
-          RUN_NUMBER=$(gh run view "$run_id" --json number --jq '.number')
-          echo "preview_version=$VERSION-preview.$RUN_NUMBER" >> "$GITHUB_OUTPUT"
-
-      - name: Open version-bump PR against main
-        id: mainbump
-        # Gated on the branch cut, not the publish: advancing main is independent
-        # of the publish, and a failed publish is carried as a warning.
-        if: always() && steps.cutbranch.outcome == 'success' && steps.target.outputs.proceed == 'true' && github.event.inputs.dry_run != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
           CUT_LINE: ${{ steps.target.outputs.cut_line }}
           NEXT_LINE: ${{ steps.target.outputs.next_line }}
         run: |
@@ -278,11 +237,6 @@ jobs:
             exit 0
           fi
           BODY="Automated sprint cut: \`release/v$CUT_LINE\` was cut. Merge to advance \`main\` to \`$NEXT_LINE.0\`, in step with $CORE_REPO. Merge it before the next cut, or that cut stops at the lockstep check. Stable \`$CUT_LINE.0\` is promoted manually — see docs/release.md."
-          if [ "${PUBLISH_OUTCOME:-}" = "success" ]; then
-            BODY="$BODY"$'\n\n'":white_check_mark: preview build published from \`release/v$CUT_LINE\`."
-          else
-            BODY="$BODY"$'\n\n'":warning: The preview publish did **not** succeed (outcome: \`${PUBLISH_OUTCOME:-unknown}\`). Check the run logs before merging."
-          fi
           # A PR opened with GITHUB_TOKEN does not trigger the required checks:
           # close and reopen it to run them.
           BODY="$BODY"$'\n\n'"> Opened by \`GITHUB_TOKEN\`, so required checks do not start on their own: close and reopen this PR to run them."
@@ -303,14 +257,11 @@ jobs:
           NEXT_LINE: ${{ steps.target.outputs.next_line }}
           SHORT_SHA: ${{ steps.cutbranch.outputs.short_sha }}
           CUT_OUTCOME: ${{ steps.cutbranch.outcome }}
-          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
-          PREVIEW_VERSION: ${{ steps.publish.outputs.preview_version }}
           BUMP_URL: ${{ steps.mainbump.outputs.url }}
         run: |
           {
             echo "## Sprint cut"
             echo ""
             echo "- cut line: \`$CUT_LINE\` — \`release/v$CUT_LINE\` @ \`$SHORT_SHA\` ($CUT_OUTCOME)"
-            echo "- preview publish: $PUBLISH_OUTCOME $PREVIEW_VERSION"
             echo "- bump PR (-> \`$NEXT_LINE.0\`): $BUMP_URL"
           } >> "$GITHUB_STEP_SUMMARY"
