@@ -37,7 +37,7 @@ Every edge names its extractor. A `+config` or `+trace` suffix means the value w
 | Custom activity packages (compiled code) | Listed in `dependency`, not opened | Behaviour inside them is invisible |
 | Selectors with variables (`{{Title}}`) | Kept as written | The app is still known from the `app` attribute |
 | Malformed XAML | `workflow.parse_error`; finding AI-SRC-003 | Studio may still open it; check the file |
-| Activities inside a Comment Out block | Ignored: no facts, no calls, not counted; the number is noted in coverage | Disabled code does not run |
+| Activities inside a Comment Out block | Ignored: no facts, no calls, not counted; the number is noted in coverage. Only Studio's own Comment Out counts, and literal secrets inside it are still reported | Disabled code does not run, but a secret written in it is still in the source |
 | DTD declarations in a file (entities, attribute defaults) | Refused as a parse error; entities are never expanded | Unusual for Studio files; check where the file came from |
 | Files over 50 MB, packages over 1 GB inflated, more than 200,000 zip entries, wrong CRC | The file or package is refused and recorded with the reason | Usually a corrupt or unusual package |
 | `project.json` that is not valid JSON | `coverage.status = partial`: workflows are read, dependencies and entry points are unknown | Fix the file, or treat the automation's library links as unknown |

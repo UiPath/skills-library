@@ -10,7 +10,7 @@ The `review` command clears the `finding` table and rebuilds it from the index. 
 | AI-RES-002 | Info | Asset exists, but not in the folder of the process that reads it | Possible runtime failure, or the asset is shared through another folder. Skipped when the activity sets an explicit folder |
 | AI-RES-003 | Warning | Queue referenced in code does not exist in Orchestrator | Same caveat as AI-RES-001 |
 | AI-RES-004 | Info | Orchestrator asset not referenced by any indexed package | Candidate for clean-up. The detail states the coverage gaps; with compiled-only packages or dynamic asset reads, "unused" is not proven |
-| AI-RUN-001 | Warning | Deployed process with no runs in the job window | Orphan candidate. The window is `jobs_window_days`; if `jobs_truncated` is set, counts are lower bounds |
+| AI-RUN-001 | Warning | Deployed process with no runs in the job window | Orphan candidate. The window is `jobs_window_days`; if `jobs_truncated` is set, counts are lower bounds. Not reported when the latest crawl's job list failed or was skipped |
 | AI-RUN-002 | Warning | Process failed in more than 20% of runs | At least 5 runs in the window |
 | AI-LIB-001 | Info | Same library at several versions across deployed processes | Library version drift |
 | AI-LIB-002 | Info | Activity package at more than two versions | Activity package drift |

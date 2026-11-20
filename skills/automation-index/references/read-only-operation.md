@@ -12,7 +12,7 @@ These are the only `uip` commands in `scripts/automation-index.mjs`. All of them
 | `uip or assets list --folder-key K` | Asset names, types and scope. Not values |
 | `uip or queues list`, `uip or buckets list`, `uip or triggers list --type T`, `uip or machines list` | Resource inventory |
 | `uip or jobs list --all-folders --all-fields --created-after D` | Aggregated into run counts and identities. Job payloads are not stored |
-| `uip or jobs get KEY` | Only with `--resolve-identities`: one call per distinct identity, to read the Orchestrator robot identity |
+| `uip or jobs get KEY --no-download` | Only with `--resolve-identities`: one call per distinct identity, to read the Orchestrator robot identity. `--no-download` stops the CLI from saving the job's output file to the current directory |
 | `uip or packages download ID:VERSION --feed-id F` | The deployed package, from the feed the process uses, including folder feeds |
 | `uip or feeds list`, `uip or libraries download ID:VERSION` | Custom libraries pinned by deployed packages |
 | `uip rpa analyze COPY_DIR` | Only in the `analyze` step, on a throwaway copy |

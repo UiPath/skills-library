@@ -770,6 +770,7 @@ function decodeXml(buf) {
 }
 
 const XML_NS = "http://www.w3.org/XML/1998/namespace";
+const UIPATH_ACTIVITIES_NS = "http://schemas.uipath.com/workflow/activities";
 const INVALID_XML_CHAR = /[\x00-\x08\x0B\x0C\x0E-\x1F\uFFFE\uFFFF]/;
 const NAME_RE = /[^\s\/>=<"']+/y;
 // XML Name: a letter, '_' or ':' first; with namespaces, at most one ':' and not at either end.
@@ -1343,9 +1344,17 @@ class PackageExtractor {
     const stack = [[root, { file: rel, line: root.line, activity: activityPrefix, activity_type: null }]];
     while (stack.length) {
       const [node, parentCtx] = stack.pop();
-      if (node.local === "CommentOut") {
+      if (node.local === "CommentOut" && node.ns === UIPATH_ACTIVITIES_NS && !parentCtx.disabled) {
         // Studio's Comment Out disables everything inside it: not run, so no facts, calls or counts from it.
+        // Only Studio's own element counts (a look-alike in another namespace runs like any activity),
+        // and the disabled code is still scanned for hard-coded secrets: a secret in source leaks either way.
         this.disabled += [...iterNodes(node)].filter((x) => x !== node && x.attrs["WorkflowViewState.IdRef"]).length;
+        for (let i = node.children.length - 1; i >= 0; i--) stack.push([node.children[i], { ...parentCtx, disabled: true, line: node.line }]);
+        continue;
+      }
+      if (parentCtx.disabled) {
+        this.disabledSecrets(node, { ...parentCtx, line: node.line });
+        for (let i = node.children.length - 1; i >= 0; i--) stack.push([node.children[i], parentCtx]);
         continue;
       }
       const idref = node.attrs["WorkflowViewState.IdRef"];
@@ -1372,6 +1381,24 @@ class PackageExtractor {
       for (let i = node.children.length - 1; i >= 0; i--) stack.push([node.children[i], ctx]);
     }
     return count;
+  }
+
+  /** Inside a Comment Out block: only literal secrets are recorded. */
+  disabledSecrets(n, ctx) {
+    const where = (k) => `literal value in ${n.local}.${k}, inside a Comment Out block (disabled code)`;
+    for (const [k, v] of Object.entries(n.attrs)) {
+      if (!v) continue;
+      if (SECRET_ATTRS.has(k)) {
+        const c = classifyAttr(v);
+        if (c !== null && c.isStatic && c.static.trim()) this.edge("hardcoded_secret", redacted(c.static), ctx, `${n.local}.${k}`.toLowerCase(), where(k), true, "xaml:disabled", "high");
+      }
+      for (const [rx, label] of SECRET_IN_EXPR) {
+        for (const m of v.matchAll(rx)) {
+          if (m[1].startsWith("{") || m[1].startsWith("[") || ["password", "pwd"].includes(m[1].toLowerCase())) continue;
+          this.edge("hardcoded_secret", redacted(m[1]), ctx, label.toLowerCase(), `${label}, inside a Comment Out block (disabled code)`, true, "xaml:disabled", "medium");
+        }
+      }
+    }
   }
 
   addVarSource(file, name, src) {
@@ -2530,6 +2557,7 @@ function cmdCrawl(a) {
   db.commit();
 
   if (!a.skipJobs) crawlJobs(db, uip, a, attempt);
+  else setMeta(db, "inventory_jobs_ok", "0"); // previous run counts, if any, are not from this crawl
 
   log("downloading deployed packages...");
   const pkgDir = indexSubdir(a.indexDir, "packages");
@@ -2623,7 +2651,8 @@ function crawlJobs(db, uip, a, attempt) {
   for (const v of ident.values()) {
     let orch = null;
     if (a.resolveIdentities && v.job) {
-      const d = attempt(`jobs get ${v.job}`, () => uip.run("or", "jobs", "get", v.job));
+      // --no-download: jobs get otherwise saves the job's output file to the current directory.
+      const d = attempt(`jobs get ${v.job}`, () => uip.run("or", "jobs", "get", v.job, "--no-download"));
       orch = ((d || {}).Data || {}).OrchestratorUserIdentity ?? null;
     }
     db.run("INSERT INTO job_identity VALUES (?,?,?,?,?,?,?,?,?)", ...v.key, orch, v.runs, v.last, v.job);
@@ -2873,13 +2902,13 @@ const RULES = [
         AND e.normalized=lower(a.name))`, caveat);
   }],
   ["AI-RUN-001", "Warning", "Deployed process with no runs in the job window", (db) => {
-    if (!db.one("SELECT value FROM meta WHERE key='jobs_window_days'")) return [];
+    if (!jobsCurrent(db)) return [];
     return db.rows(`SELECT package_id, version, process_key, process_name,
            'folder ' || folder_path || '; type ' || COALESCE(process_type,'') || '; window ' ||
            (SELECT value FROM meta WHERE key='jobs_window_days') || ' days', NULL
        FROM v_automation WHERE runs = 0 AND COALESCE(process_type,'') NOT IN ('Agent','Flow')`);
   }],
-  ["AI-RUN-002", "Warning", "Process failed in more than 20% of runs", (db) => db.rows(
+  ["AI-RUN-002", "Warning", "Process failed in more than 20% of runs", (db) => !jobsCurrent(db) ? [] : db.rows(
     `SELECT package_id, version, process_key, process_name,
             faulted || ' faulted of ' || runs || ' runs; last success ' || COALESCE(last_success,'never'), NULL
      FROM v_automation WHERE runs >= 5 AND faulted * 1.0 / runs > 0.2`)],
@@ -2918,6 +2947,13 @@ const RULES = [
   ["AI-LNK-002", "Info", "Queue read by an automation but written by none of the indexed automations", (db) => queueHandoverRule(db, "get")],
   ["AI-GOV-001", "Critical", "Application or URL outside the restriction list", (db, ctx) => restrictionRule(db, ctx)],
 ];
+
+/** Run counts come from the latest crawl's job list (not a failed or skipped one). */
+function jobsCurrent(db) {
+  const flag = db.one("SELECT value FROM meta WHERE key='inventory_jobs_ok'");
+  if (flag) return flag[0] === "1";
+  return !!db.one("SELECT value FROM meta WHERE key='jobs_window_days'"); // indexes from before the flag existed
+}
 
 /** Was the Orchestrator inventory of this resource type read completely? */
 function inventoryUsable(db, type) {
