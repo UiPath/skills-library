@@ -57,12 +57,17 @@ The cut runs **Sunday 06:30 UTC**, gated to the **14-day cadence** anchored at `
 
 1. **Checks lockstep.** The core repo's `main` must still be on `M.N`, or it must already have `release/v<M.N>`. Otherwise the cut stops with an error: one repo has advanced and the other has not. It also stops when this repo already has `release/v<M.N>` and the core repo has moved on: the last bump PR was never merged.
 2. **Cuts `release/v<M.N>`** from `main` at the version already there. No bump.
-3. **Publishes `preview`** by dispatching `publish.yml` on the release branch, and waits for it. The dispatch is explicit, because a push made with `GITHUB_TOKEN` does not trigger other workflows. There is no `dev` build: `main` already published one for the same commit.
-4. **Opens a PR bumping `main` to `M.(N+1).0`**, even when the publish failed, with a warning in the body. Merge it before the next cut, or that cut stops at the lockstep check. GitHub does not start required checks on a PR opened with `GITHUB_TOKEN`: close and reopen it to run them.
+3. **Opens a PR bumping `main` to `M.(N+1).0`.** Merge it before the next cut, or that cut stops at the lockstep check. GitHub does not start required checks on a PR opened with `GITHUB_TOKEN`: close and reopen it to run them.
 
-The cut never publishes `latest`. If a run fails after cutting the branch, the next run finds `release/v<M.N>` on line `M.N` and resumes. If the core repo merged its bump PR in between, the lockstep check stops that run: dispatch with `minor_override` set to `M.N` to resume.
+The cut publishes nothing. Its push uses `GITHUB_TOKEN`, which does not trigger `publish.yml`, so the line's first preview comes from the first merge into `release/v<M.N>`, or from a manual run:
 
-Off-cadence or out-of-sequence cut: run **Sprint Release Cut** with `minor_override` (for example `1.208`), which skips the cadence gate and the lockstep check. The override cannot be below `main`'s line, because the branch is cut from `main` and the manifests never go backwards. `dry_run` prints the plan without pushing, publishing or opening a PR.
+```bash
+gh workflow run publish.yml --ref release/v<M.N> -f channel=preview
+```
+
+If a run fails after cutting the branch, the next run finds `release/v<M.N>` on line `M.N` and resumes. If the core repo merged its bump PR in between, the lockstep check stops that run: dispatch with `minor_override` set to `M.N` to resume.
+
+Off-cadence or out-of-sequence cut: run **Sprint Release Cut** with `minor_override` (for example `1.208`), which skips the cadence gate and the lockstep check. The override cannot be below `main`'s line, because the branch is cut from `main` and the manifests never go backwards. `dry_run` prints the plan without pushing or opening a PR.
 
 ### Promote a line to stable
 
