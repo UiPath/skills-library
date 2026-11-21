@@ -1222,3 +1222,228 @@ else ok([]);`);
     assert.equal(openDb(ix).prepare("SELECT count(*) n FROM finding WHERE rule LIKE 'AI-RUN-%'").get().n, 0);
   });
 });
+
+describe("impact, version diff, SARIF and CycloneDX", () => {
+  let tmp, ix, repo;
+  const act = (body) => `<Activity ${NS}><Sequence sap2010:WorkflowViewState.IdRef="S1">${body}</Sequence></Activity>`;
+  const NEW_MAIN = act(`
+<ui:GetRobotAsset AssetName="Api_Key" sap2010:WorkflowViewState.IdRef="A1"/>
+<ui:HttpClient DisplayName="Call API" EndPoint="https://new.example.com/v2" Password="N3wS3cretValue"/>
+<ui:HttpClient DisplayName="Call API" EndPoint="https://new.example.com/v3" Password="N3wS3cretOther"/>`);
+  before(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "ai-impact-"));
+    repo = path.join(tmp, "repo");
+    const proj = (dir, extra, body) => {
+      write(path.join(repo, dir, "project.json"), JSON.stringify({ name: dir, main: "Main.xaml", ...extra }));
+      write(path.join(repo, dir, "Main.xaml"), act(body));
+    };
+    proj("Writer", { dependencies: { "Shared.Lib": "[1.0.0]", "UiPath.System.Activities": "[25.10.0]" } },
+      `<ui:AddQueueItem QueueName="Orders" sap2010:WorkflowViewState.IdRef="Q1"/><ui:GetRobotAsset AssetName="Api_Key" sap2010:WorkflowViewState.IdRef="A1"/>`);
+    proj("Reader", {}, `<ui:GetTransactionItem QueueType="Orders" sap2010:WorkflowViewState.IdRef="G1"/>`);
+    proj("LibUser", { dependencies: { "shared.lib": "[1.0.0]" } }, `<ui:LogMessage sap2010:WorkflowViewState.IdRef="L1"/>`);
+    // a second checkout of Reader, and a link inside it that points outside the project
+    write(path.join(repo, "Copy", "Reader", "project.json"), JSON.stringify({ name: "Reader", main: "Main.xaml" }));
+    write(path.join(repo, "Copy", "Reader", "Main.xaml"), act(`<ui:LogMessage sap2010:WorkflowViewState.IdRef="L1"/>`));
+    write(path.join(tmp, "outside", "Main.xaml"), act(""));
+    fs.symlinkSync(path.join(tmp, "outside"), path.join(repo, "Reader", "link"));
+    const pk = path.join(tmp, "pk");
+    fs.mkdirSync(pk, { recursive: true });
+    nupkg(path.join(pk, "lib.nupkg"), "Shared.Lib", "1.0.0", {
+      "project.json": JSON.stringify({ name: "Shared.Lib", main: "Get.xaml", designOptions: { outputType: "Library" } }),
+      "Get.xaml": act(`<ui:GetRobotAsset AssetName="Api_Key" sap2010:WorkflowViewState.IdRef="A1"/><ui:HttpClient EndPoint="https://lib.example.com/api" sap2010:WorkflowViewState.IdRef="H1"/>`),
+    });
+    nupkg(path.join(pk, "n1.nupkg"), "Proc.N", "1.0.0", {
+      "project.json": JSON.stringify({ name: "Proc.N", main: "Main.xaml" }),
+      "Main.xaml": act(`<ui:GetRobotAsset AssetName="Api_Key" sap2010:WorkflowViewState.IdRef="A1"/>`),
+      "applicationsMetadata.json": JSON.stringify({ Metadata: [
+        { ApplicationType: "Browser", Url: { Value: "in_PortalRoot & in_PagePath", IsExpression: true } },
+        { ApplicationType: "Browser", Url: { Value: "\"https://quoted.example.com/home\"", IsExpression: true } }] }),
+    });
+    nupkg(path.join(pk, "n2.nupkg"), "Proc.N", "1.1.0", { "project.json": JSON.stringify({ name: "Proc.N", main: "Main.xaml" }), "Main.xaml": NEW_MAIN });
+    ix = path.join(tmp, "ix");
+    let r = run(ix, "extract", "--source", repo, "--nupkg", pk);
+    assert.equal(r.status, 0, r.stderr);
+    const w = openDb(ix);
+    const ver = (p) => w.prepare("SELECT max(version) v FROM package WHERE package_id=? AND version NOT LIKE '%Copy%'").get(p).v;
+    const procs = [["K1", "Writer", "Writer", "Finance"], ["K2", "Reader", "Reader", "Finance"],
+      ["K3", "LibUser", "LibUser", "HR"], ["K4", "ProcN", "Proc.N", "HR"]].map(([k, n, p, f]) => [k, n, p, ver(p), f]);
+    for (const [k, n, p, v, f] of procs) w.prepare("INSERT INTO process VALUES (?,?,?,?,?,?,'Process',NULL,NULL,1,0,NULL,'[]',NULL,NULL)").run(k, n, "fk-" + f, f, p, v);
+    w.prepare("INSERT INTO job_summary VALUES ('K1','Writer','Finance',40,12,0,0,40,NULL,NULL,90)").run();
+    for (const [k, v] of [["inventory_process_ok", "1"], ["inventory_jobs_ok", "1"], ["jobs_window_days", "90"], ["inventory_asset_ok", "1"]]) w.prepare("INSERT OR REPLACE INTO meta VALUES (?, ?)").run(k, v);
+    w.prepare("INSERT INTO orch_asset VALUES ('a1','fk-Finance','Finance','Api_Key','Text','Folder',1,NULL)").run();
+    w.close();
+    r = run(ix, "review");
+    assert.equal(r.status, 0, r.stderr);
+  });
+
+  const impact = (...args) => {
+    const r = run(ix, "impact", ...args, "--format", "json");
+    assert.equal(r.status, 0, r.stderr);
+    return JSON.parse(r.stdout);
+  };
+
+  test("impact lists direct users and users through a library, with runs, folders and a risk grade", () => {
+    const r = impact("--kind", "asset", "--name", "API_KEY");
+    assert.deepEqual(r.processes.map((p) => p.process), ["Writer", "LibUser", "ProcN"]); // most active first
+    assert.deepEqual(r.processes.find((p) => p.process === "LibUser").via.length, 1);
+    assert.equal(r.processes.find((p) => p.process === "Writer").runs_30d, 12);
+    assert.deepEqual(r.orchestrator.found, ["Api_Key (Finance)"]);
+    assert.equal(r.risk.level, "medium"); // 3 processes, 1 active, 2 folders
+    assert.equal(r.unknowns.run_counts_current, true);
+    assert.equal(impact("--kind", "asset", "--name", "api_*").processes.length, 3);
+    assert.equal(impact("--kind", "asset", "--name", "nothing_here").risk.level, "none");
+  });
+
+  test("impact on a queue gives both sides; on a host it accepts a URL; on a library it uses the dependency graph", () => {
+    const q = impact("--kind", "queue", "--name", "orders");
+    assert.deepEqual(q.processes.map((p) => `${p.process}:${p.modes.join("")}`).sort(), ["Reader:get", "Writer:add"]);
+    assert.equal(impact("--kind", "host", "--name", "https://lib.example.com/api?page=1").processes.length, 2);
+    const h = impact("--kind", "host", "--name", "https://LIB.example.com/other/path");
+    assert.equal(h.normalized, "lib.example.com");
+    assert.deepEqual(h.processes.map((p) => p.process).sort(), ["LibUser", "Writer"]);
+    assert.deepEqual(impact("--kind", "library", "--name", "shared.lib").processes.map((p) => p.process).sort(), ["LibUser", "Writer"]);
+    const md = run(ix, "impact", "--kind", "queue", "--name", "orders");
+    assert.match(md.stdout, /## What the index cannot rule out/);
+    assert.notEqual(run(ix, "impact", "--kind", "queue").status, 0);
+  });
+
+  test("the most shared resources are ranked, in impact --top and in INDEX.md", () => {
+    const top = impact("--top", "10");
+    assert.deepEqual(top[0], { kind: "asset", name: "api_key", processes: 3, folders: 2, active_30d: 1 });
+    assert.ok(top.some((t) => t.kind === "library" && t.name === "Shared.Lib" && t.processes === 2));
+    assert.ok(top.every((t) => t.processes > 1));
+    assert.equal(run(ix, "cards").status, 0);
+    assert.match(fs.readFileSync(path.join(ix, "INDEX.md"), "utf8"), /## Most shared resources[\s\S]*\| asset \| api_key \| 3 \| 2 \| 1 \|/);
+  });
+
+  test("an expression in applicationsMetadata.json is dynamic, not a host; a quoted literal is a host", () => {
+    const db = openDb(ix);
+    const rows = db.prepare("SELECT normalized, static FROM edge WHERE package_id='Proc.N' AND version='1.0.0' AND extractor='studio_applications_metadata' ORDER BY normalized").all();
+    assert.deepEqual(rows.map((x) => [x.normalized, x.static]), [["<dynamic>", 0], ["quoted.example.com", 1]]);
+  });
+
+  test("diff between two versions shows new external reach; a baseline export diffs the whole index", () => {
+    let r = run(ix, "diff", "--package", "Proc.N", "--from", "1.0.0", "--to", "1.1.0", "--format", "json");
+    assert.equal(r.status, 0, r.stderr);
+    const d = JSON.parse(r.stdout);
+    const hosts = d.changed[0].fields.find((f) => f.field === "hosts");
+    assert.deepEqual(hosts.added, ["new.example.com"]);
+    assert.deepEqual(hosts.removed, ["quoted.example.com"]);
+    assert.ok(d.changed[0].fields.some((f) => f.field === "findings" && f.added.some((x) => x.startsWith("AI-SEC-001"))));
+    assert.match(run(ix, "diff", "--package", "Proc.N", "--from", "1.0.0", "--to", "1.1.0").stdout, /## New external reach[\s\S]*new\.example\.com/);
+    const base = path.join(tmp, "base.jsonl");
+    assert.equal(run(ix, "export", "--out", base).status, 0);
+    r = JSON.parse(run(ix, "diff", "--baseline", base, "--format", "json").stdout);
+    assert.equal(r.changed.length + r.added.length + r.removed.length, 0);
+    // drop one package and age another in the baseline
+    const lines = fs.readFileSync(base, "utf8").trim().split("\n").map((l) => JSON.parse(l)).filter((f) => f.package_id !== "Reader");
+    const w = lines.find((f) => f.package_id === "Writer");
+    w.queues.writes = [];
+    fs.writeFileSync(base, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    r = JSON.parse(run(ix, "diff", "--baseline", base, "--format", "json").stdout);
+    assert.deepEqual(r.added, ["Reader@source:repo/Reader"]);
+    assert.deepEqual(r.changed.map((c) => [c.package_id, c.fields.map((f) => f.field + "+" + f.added.join())]), [["Writer", ["queue_writes+orders"]]]);
+    fs.writeFileSync(base, "{\"not\": \"a fingerprint\"}\n");
+    assert.match(run(ix, "diff", "--baseline", base).stderr, /not an automation-index fingerprint/);
+    assert.match(run(ix, "diff", "--package", "Proc.N", "--from", "1.0.0", "--to", "9.9").stderr, /not in the index/);
+  });
+
+  test("SARIF: valid shape, rule metadata, real file locations and stable fingerprints", () => {
+    const out = path.join(tmp, "f.sarif");
+    assert.equal(run(ix, "export", "--format", "sarif", "--out", out).status, 0);
+    const s = JSON.parse(fs.readFileSync(out, "utf8"));
+    assert.equal(s.version, "2.1.0");
+    const { rules } = s.runs[0].tool.driver;
+    for (const r of rules) {
+      assert.ok(r.id && r.shortDescription.text && r.fullDescription.text && r.help.text, r.id);
+      assert.ok(["error", "warning", "note"].includes(r.defaultConfiguration.level));
+    }
+    assert.equal(rules.find((r) => r.id === "AI-SEC-001").properties["security-severity"], "9.0");
+    const sec = s.runs[0].results.find((r) => r.ruleId === "AI-SEC-001");
+    assert.equal(sec.level, "error");
+    assert.equal(rules[sec.ruleIndex].id, "AI-SEC-001");
+    const loc = sec.locations[0].physicalLocation;
+    const file = fileURLToPath(loc.artifactLocation.uri);
+    assert.ok(fs.existsSync(file) && file.endsWith("Main.xaml"), file);
+    const lines = fs.readFileSync(file, "utf8").split("\n");
+    assert.match(lines[loc.region.startLine - 1], /HttpClient/);
+    assert.ok(!JSON.stringify(s).includes("N3wS3cretValue"));
+    // a finding on a source project points into the project folder, not the index copy
+    const src = s.runs[0].results.find((r) => r.properties.package?.startsWith("Reader@") && r.locations?.[0].physicalLocation);
+    assert.ok(fileURLToPath(src.locations[0].physicalLocation.artifactLocation.uri).startsWith(fs.realpathSync(repo)) ||
+      fileURLToPath(src.locations[0].physicalLocation.artifactLocation.uri).startsWith(repo));
+    // two secrets in one file are two alerts
+    const secFp = s.runs[0].results.filter((r) => r.ruleId === "AI-SEC-001").map((r) => r.partialFingerprints["automationIndexFinding/v1"]);
+    assert.equal(secFp.length, 2);
+    assert.equal(new Set(secFp).size, 2);
+    // a finding inherited from a library points into the library's files
+    const inh = s.runs[0].results.find((r) => r.ruleId === "AI-RES-002" && r.properties.package.startsWith("LibUser@"));
+    assert.ok(inh, "inherited wrong-folder finding");
+    assert.match(fileURLToPath(inh.locations[0].physicalLocation.artifactLocation.uri), /Shared\.Lib@1\.0\.0_[0-9a-f]+[\/\\]Get\.xaml$/);
+    // fingerprints survive a second review
+    assert.equal(run(ix, "review").status, 0);
+    const out2 = path.join(tmp, "f2.sarif");
+    assert.equal(run(ix, "export", "--format", "sarif", "--out", out2).status, 0);
+    const fp = (doc) => doc.runs[0].results.map((r) => r.partialFingerprints["automationIndexFinding/v1"]).sort();
+    assert.deepEqual(fp(JSON.parse(fs.readFileSync(out2, "utf8"))), fp(s));
+  });
+
+  test("SARIF never points through a link that leaves the package, and keeps identical findings apart", () => {
+    const db = openDb(ix);
+    const v = db.prepare("SELECT version FROM package WHERE package_id='Reader' AND version NOT LIKE '%Copy%'").get().version;
+    db.prepare("INSERT INTO finding VALUES ('AI-SRC-003','Warning','Reader',?,NULL,'link/Main.xaml','test','link/Main.xaml:1',NULL)").run(v);
+    // two findings identical in every column (two secrets in one property) are still two alerts
+    for (let i = 0; i < 2; i++) db.prepare("INSERT INTO finding VALUES ('AI-SEC-001','Critical','Reader',?,NULL,'conn.password','x','Main.xaml:1 [Q1]',NULL)").run(v);
+    db.close();
+    const s = JSON.parse(run(ix, "export", "--format", "sarif").stdout);
+    const twins = s.runs[0].results.filter((x) => x.properties.evidence === "Main.xaml:1 [Q1]").map((x) => x.partialFingerprints["automationIndexFinding/v1"]);
+    assert.equal(new Set(twins).size, 2);
+    const r = s.runs[0].results.find((x) => x.properties.evidence === "link/Main.xaml:1");
+    const uri = r.locations?.[0].physicalLocation?.artifactLocation.uri;
+    if (uri) assert.ok(fs.realpathSync(fileURLToPath(uri)).startsWith(fs.realpathSync(path.join(repo, "Reader")) + path.sep), uri);
+    assert.equal(run(ix, "review").status, 0);
+  });
+
+  test("baseline versions follow NuGet order: a release outranks its prerelease", async () => {
+    const { cmpVersion } = await import(pathToFileURL(SCRIPT).href);
+    assert.ok(cmpVersion("1.0.0-beta", "1.0.0") < 0);
+    assert.ok(cmpVersion("1.10.0", "1.9.0") > 0);
+    assert.ok(cmpVersion("1.0.0-beta.2", "1.0.0-beta.10") < 0);
+    assert.ok(cmpVersion("1.0.0-alpha", "1.0.0-beta") < 0);
+    assert.equal(cmpVersion("1.0.0+build5", "1.0.0"), 0);
+  });
+
+  test("CycloneDX: packages, libraries and hosts as one consistent dependency graph", () => {
+    const r = run(ix, "export", "--format", "cyclonedx");
+    assert.equal(r.status, 0, r.stderr);
+    const b = JSON.parse(r.stdout);
+    assert.equal(b.bomFormat, "CycloneDX");
+    assert.equal(b.specVersion, "1.6");
+    assert.match(b.serialNumber, /^urn:uuid:[0-9a-f-]{36}$/);
+    const refs = new Set([...b.components, ...b.services].map((c) => c["bom-ref"]));
+    assert.equal(refs.size, b.components.length + b.services.length); // unique
+    for (const d of b.dependencies) {
+      assert.ok(refs.has(d.ref), d.ref);
+      for (const x of d.dependsOn) assert.ok(refs.has(x), x);
+    }
+    const lib = b.components.find((c) => c.name === "Shared.Lib");
+    assert.equal(lib.purl, "pkg:nuget/Shared.Lib@1.0.0");
+    assert.equal(lib.type, "library");
+    assert.match(lib.hashes[0].content, /^[0-9a-f]{64}$/);
+    const writer = b.components.find((c) => c.name === "Writer");
+    assert.equal(writer.purl, undefined); // a source folder has no package URL
+    const deps = b.dependencies.find((d) => d.ref === writer["bom-ref"]).dependsOn;
+    assert.ok(deps.includes("pkg:nuget/Shared.Lib@1.0.0"));
+    assert.ok(deps.includes("pkg:nuget/UiPath.System.Activities@25.10.0"));
+    assert.ok(b.dependencies.find((d) => d.ref === lib["bom-ref"]).dependsOn.includes("host:lib.example.com"));
+    assert.ok(!b.services.some((s) => s.name.includes("&")));
+    // two checkouts with one name stay two components
+    assert.equal(b.components.filter((c) => c.name === "Reader").length, 2);
+    // a differently cased reference reaches the indexed library
+    const lu = b.components.find((c) => c.name === "LibUser");
+    assert.deepEqual(b.dependencies.find((d) => d.ref === lu["bom-ref"]).dependsOn, ["pkg:nuget/Shared.Lib@1.0.0"]);
+    // a dependency that was never opened has an unknown graph, not an empty one
+    assert.ok(!b.dependencies.some((d) => d.ref === "pkg:nuget/UiPath.System.Activities@25.10.0"));
+    assert.ok(b.compositions.some((c) => c.aggregate === "unknown" && c.dependencies.includes("pkg:nuget/UiPath.System.Activities@25.10.0")));
+  });
+});

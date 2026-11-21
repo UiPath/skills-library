@@ -9,7 +9,7 @@ Every edge names its extractor. A `+config` or `+trace` suffix means the value w
 | `xaml:literal`, `cs:literal` | Literal `http(s)://` strings in expressions and code | medium |
 | `xaml:code` | URLs, Config keys and credential patterns inside Invoke Code / PowerShell bodies | medium |
 | `object_repository`, `object_repository:selector` | `.objects/` screens and elements, labelled with the app / screen / element names | high / medium |
-| `studio_applications_metadata` | `applicationsMetadata.json`, which Studio writes at publish and Orchestrator shows as "used applications" | high |
+| `studio_applications_metadata` | `applicationsMetadata.json`, which Studio writes at publish and Orchestrator shows as "used applications". An entry marked as an expression is `<dynamic>` unless it is a plain string literal | high |
 | `xaml` connector configuration | The gzip+base64 `Configuration` of Integration Service activities: connector, operation, object, HTTP method and path. Cached lookup values and schemas are never read | high |
 | `package_bindings` | `bindings_v2.json` resources (assets, queues, processes, connections). Present even in compiled packages. | high |
 | `config_assets_sheet` | Rows of the Config **Assets** sheet (REFramework loads every row with Get Asset at start) | medium |

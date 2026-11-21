@@ -1,6 +1,6 @@
 # Index schema and example queries
 
-The index is one SQLite file, `INDEX_DIR/index.db`. Query it only with the `query` command, which opens it read-only.
+The index is one SQLite file, `INDEX_DIR/index.db`. Query it only with the `query` command, which opens it read-only. For change impact and version comparisons, try `impact` and `diff` first ([formats.md](formats.md)). They run the joins below and report what they cannot see.
 
 ```bash
 node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT ..." [--format table|json|csv] [--limit N]

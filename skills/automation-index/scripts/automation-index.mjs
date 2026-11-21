@@ -30,7 +30,7 @@ import { pathToFileURL } from "node:url";
 
 const TOOL_VERSION = "1.0.0";
 // Bump when extraction logic changes; packages indexed by an older extractor are re-read.
-const EXTRACTOR_VERSION = 4;
+const EXTRACTOR_VERSION = 5;
 // Version of the table and export layout other tools read (bumped on incompatible changes).
 const SCHEMA_VERSION = 1;
 const PAGE = 50;
@@ -2316,10 +2316,18 @@ function extractOne(db, indexDir, p, kind = "process", origin = "download", forc
     try {
       for (const m of jsonLoads(am).Metadata || []) {
         const ctx = { file: "applicationsMetadata.json", line: null, activity: null, activity_type: "studio" };
+        // An expression is only a value when it is a plain string literal; anything else is built at runtime.
+        const literal = (f) => (!f.IsExpression ? f.Value : (/^\s*"([^"]*)"\s*$/.exec(f.Value) || [])[1] ?? null);
         const exe = m.ExecutablePath || {};
-        if (exe.Value) ex.edge("uses_application", exe.Value, ctx, normApp(exe.Value), m.ApplicationType ?? null, !exe.IsExpression, "studio_applications_metadata", "high");
+        if (exe.Value) {
+          const v = literal(exe);
+          ex.edge("uses_application", exe.Value, ctx, v ? normApp(v) : DYN, m.ApplicationType ?? null, !!v, "studio_applications_metadata", "high");
+        }
         const url = m.Url || {};
-        if (url.Value) ex.edge("targets_url", url.Value, ctx, normHost(url.Value) || url.Value.toLowerCase(), m.ApplicationType ?? null, !url.IsExpression, "studio_applications_metadata", "high");
+        if (url.Value) {
+          const v = literal(url);
+          ex.edge("targets_url", url.Value, ctx, v ? normHost(v) || v.toLowerCase() : DYN, m.ApplicationType ?? null, !!v, "studio_applications_metadata", "high");
+        }
       }
     } catch { /* unreadable metadata */ }
   }
@@ -2985,8 +2993,8 @@ function resourceRule(db, type, check) {
   }
   const kinds = type === "queue" ? "('uses_queue')" : "('reads_asset','reads_credential')";
   const groups = new Map();
-  for (const [pkg, ver, pkey, pfolder, pfkey, kind, value, norm, detail, file, line, via] of db.rows(
-    `SELECT e.root_package_id, e.root_version, p.key, p.folder_path, p.folder_key, e.kind, e.value, e.normalized, e.detail, e.file, e.line, e.via
+  for (const [pkg, ver, pkey, pfolder, pfkey, kind, value, norm, detail, file, line, via, epkg, ever] of db.rows(
+    `SELECT e.root_package_id, e.root_version, p.key, p.folder_path, p.folder_key, e.kind, e.value, e.normalized, e.detail, e.file, e.line, e.via, e.package_id, e.version
      FROM process p JOIN v_edge_all e ON e.root_package_id=p.package_id AND e.root_version=p.version
      WHERE e.kind IN ${kinds} AND e.normalized <> '<dynamic>' ORDER BY p.key, e.file, e.line`)) {
     const named = (/folder=([^;]+)/.exec(detail || "") || [])[1]?.trim();
@@ -3003,7 +3011,9 @@ function resourceRule(db, type, check) {
     }
     if (!problem) continue;
     const k = [pkey, kind, norm, problem].join("\u0000");
-    if (!groups.has(k)) groups.set(k, { row: [pkg, ver, pkey, value], kind, problem, pfolder, via, n: 0, first: `${file}${line ? ":" + line : ""}` });
+    // evidence from a library names the library, so readers (and SARIF) look in the right package
+    const inLib = epkg !== pkg || ever !== ver ? ` (in ${epkg}@${ever})` : "";
+    if (!groups.has(k)) groups.set(k, { row: [pkg, ver, pkey, value], kind, problem, pfolder, via, n: 0, first: `${file}${line ? ":" + line : ""}${inLib}` });
     groups.get(k).n++;
   }
   return [...groups.values()].map((g) => [...g.row,
@@ -3280,6 +3290,7 @@ function cmdCards(a) {
       index.push(`| ${md(pkg)}@${md(ver)} | ${S(kind)} | [card](cards/${fn}) |`);
     }
   }
+  index.push("", "## Most shared resources\n", "Where a change spreads furthest. Run `impact --kind KIND --name NAME` for one of them.\n", mostSharedMarkdown(mostShared(db, 15)));
   removeEntry(path.join(a.indexDir, "INDEX.md"));
   fs.writeFileSync(path.join(a.indexDir, "INDEX.md"), index.join("\n") + "\n", "utf8");
   console.log(path.join(a.indexDir, "INDEX.md"));
@@ -3479,6 +3490,17 @@ function fingerprint(db, pkg, ver) {
 
 function cmdExport(a) {
   const db = connect(a.indexDir);
+  if (a.format !== "jsonl") {
+    if (a.package) throw new Exit("--package filters fingerprints only; sarif and cyclonedx cover the whole index");
+    if (a.format === "sarif" && !db.one("SELECT 1 FROM finding LIMIT 1")) process.stderr.write("warning: no findings in the index; run review first\n");
+    const doc = a.format === "sarif" ? sarifLog(db, a.indexDir) : cyclonedx(db);
+    const text = JSON.stringify(doc, null, 2) + "\n";
+    if (a.out) {
+      fs.writeFileSync(a.out, text, "utf8");
+      console.log(`${a.format} written to ${a.out}`);
+    } else process.stdout.write(text);
+    return;
+  }
   const rows = db.rows("SELECT package_id, version FROM package ORDER BY package_id, version").filter((r) => !a.package || fnmatch(r[0], a.package));
   const lines = rows.map(([pkg, ver]) => JSON.stringify(fingerprint(db, pkg, ver)));
   const out = lines.join("\n") + (lines.length ? "\n" : "");
@@ -3488,6 +3510,529 @@ function cmdExport(a) {
   } else {
     process.stdout.write(out);
   }
+}
+
+// ------------------------------------------------------------------ impact analysis
+
+/** Edge kinds a resource kind is referenced through. `library` uses the dependency graph instead. */
+const IMPACT_KINDS = {
+  asset: ["reads_asset", "writes_asset"], credential: ["reads_credential", "writes_credential"],
+  queue: ["uses_queue"], bucket: ["uses_bucket"], process: ["invokes_process"], connection: ["uses_connection"],
+  application: ["uses_application"], host: ["targets_url", "calls_api"], database: ["uses_database"],
+  "connector-operation": ["uses_connector_operation"], library: null,
+};
+const ORCH_TABLE = { asset: "orch_asset", credential: "orch_asset", queue: "orch_queue", bucket: "orch_bucket" };
+const isGlob = (s) => /[*?]/.test(s);
+
+/** The name as the extractor normalizes it, so `impact` matches what `extract` wrote. */
+function impactNorm(kind, name) {
+  const n = name.trim();
+  if (kind === "host") return normHost(n) || n.toLowerCase(); // a URL (its query string is not a glob) or a bare host
+  if (isGlob(n)) return n.toLowerCase();
+  if (kind === "application") return normApp(n);
+  return n.toLowerCase();
+}
+
+/** Deterministic risk grade from counts. A lower bound whenever something could not be seen. */
+function impactRisk(nProc, nActive, nFolders, nOther, lowerBound) {
+  let level = "none";
+  if (nProc >= 5 || nActive >= 3 || nFolders >= 3) level = "high";
+  else if (nProc >= 2 || nActive >= 1) level = "medium";
+  else if (nProc === 1 || nOther) level = "low";
+  const reason = `${nProc} deployed processes in ${nFolders} folders, ${nActive} ran in the last 30 days, ${nOther} other indexed packages`;
+  return { level, reason, lower_bound: lowerBound };
+}
+
+/** Who depends on one resource: deployed processes (also through libraries), other indexed packages,
+ * processes one hop away through process links, and what the index cannot rule out. */
+function impactOf(db, kind, name) {
+  const norm = impactNorm(kind, name);
+  const match = (v) => (isGlob(norm) ? fnmatch(String(v || "").toLowerCase(), norm) : String(v || "").toLowerCase() === norm);
+  const runs = new Map(db.rows("SELECT process_key, runs, runs_30d, last_run FROM v_automation").map((r) => [r[0], r]));
+  const procs = db.objects("SELECT key, name, folder_path, folder_key, package_id, version FROM process");
+  const procsOf = new Map();
+  for (const p of procs) {
+    const k = p.package_id + "\u0000" + p.version;
+    if (!procsOf.has(k)) procsOf.set(k, []);
+    procsOf.get(k).push(p);
+  }
+  const byRoot = new Map(); // root package -> {refs, first, via, modes, confidence, matched}
+  const hit = (root, ver, via, evidence, mode, confidence, value) => {
+    const k = root + "\u0000" + ver;
+    if (!byRoot.has(k)) byRoot.set(k, { package: root, version: ver, refs: 0, first: evidence, via: new Set(), modes: new Set(), confidence: new Set(), matched: new Set() });
+    const g = byRoot.get(k);
+    g.refs++;
+    if (via) g.via.add(via);
+    if (mode) g.modes.add(mode);
+    if (confidence) g.confidence.add(confidence);
+    if (value) g.matched.add(value);
+  };
+  const kinds = IMPACT_KINDS[kind];
+  let dynamic = [0, 0];
+  if (kinds) {
+    const marks = kinds.map(() => "?").join(",");
+    const exact = isGlob(norm) ? "" : " AND normalized = ?";
+    for (const [root, ver, via, file, line, detail, conf, nv] of db.rows(
+      `SELECT root_package_id, root_version, via, file, line, detail, confidence, normalized FROM v_edge_all
+       WHERE kind IN (${marks}) AND normalized <> '${DYN}'${exact} ORDER BY root_package_id, file, line`, ...kinds, ...(exact ? [norm] : []))) {
+      if (!match(nv)) continue;
+      hit(root, ver, via, `${file}${line ? ":" + line : ""}`, (/mode=(\w+)/.exec(detail || "") || [])[1], conf, nv);
+    }
+    dynamic = db.one(`SELECT count(*), count(DISTINCT package_id || '@' || version) FROM edge WHERE kind IN (${marks}) AND normalized = '${DYN}'`, ...kinds);
+  } else {
+    for (const [root, ver, via, dep, spec] of db.rows(
+      `SELECT c.root_id, c.root_version, c.via, d.dep_name, d.dep_spec FROM dep_closure c
+       JOIN dependency d ON d.package_id = c.package_id AND d.version = c.version ORDER BY c.root_id`)) {
+      if (!match(dep)) continue;
+      hit(root, ver, via, `project.json: ${dep} ${spec}`, null, "high", `${dep} ${spec}`);
+    }
+  }
+  const processes = [];
+  const others = [];
+  for (const g of byRoot.values()) {
+    const ps = procsOf.get(g.package + "\u0000" + g.version) || [];
+    const base = { package: g.package, version: g.version, refs: g.refs, first: g.first, via: [...g.via].sort(cmpStr),
+      modes: [...g.modes].sort(cmpStr), confidence: [...g.confidence].sort(cmpStr), matched: [...g.matched].sort(cmpStr).slice(0, 10) };
+    if (!ps.length) others.push(base);
+    for (const p of ps) {
+      const r = runs.get(p.key) || [];
+      const triggers = db.one("SELECT count(*) FROM orch_trigger WHERE enabled = 1 AND (process_key = ? OR (process_name = ? AND folder_key = ?))", p.key, p.name, p.folder_key)[0];
+      processes.push({ process_key: p.key, process: p.name, folder: p.folder_path, ...base, runs: r[1] ?? 0, runs_30d: r[2] ?? 0, last_run: r[3] ?? null, enabled_triggers: triggers });
+    }
+  }
+  processes.sort((x, y) => (y.runs_30d - x.runs_30d) || cmpStr(String(x.folder), String(y.folder)) || cmpStr(String(x.process), String(y.process)));
+  others.sort((x, y) => cmpStr(x.package, y.package));
+  const keys = new Set(processes.map((p) => p.process_key));
+  const linked = [];
+  if (keys.size) {
+    for (const [fk, fn, tk, tn, via, res] of db.rows("SELECT from_key, from_name, to_key, to_name, via, resource FROM process_link")) {
+      if (keys.has(fk) && !keys.has(tk)) linked.push({ process: tn, relation: `downstream of ${fn}`, via, resource: res });
+      else if (keys.has(tk) && !keys.has(fk)) linked.push({ process: fn, relation: `upstream of ${tn}`, via, resource: res });
+    }
+  }
+  let orchestrator = null;
+  if (ORCH_TABLE[kind] || kind === "process") {
+    const table = ORCH_TABLE[kind] || "process";
+    const ok = inventoryUsable(db, kind === "credential" ? "asset" : kind);
+    const found = db.rows(`SELECT name, folder_path FROM ${table}`).filter((r) => match(r[0])).map((r) => `${r[0]} (${S(r[1])})`);
+    orchestrator = { inventory_read: ok, found: found.sort(cmpStr) };
+  }
+  const unreadable = db.one("SELECT count(DISTINCT package_id || '@' || version) FROM coverage WHERE stage IN ('extract','download') AND status NOT IN ('indexed','ok')")[0];
+  const low = processes.concat(others).filter((g) => g.confidence.length && g.confidence.every((c) => c === "low")).length;
+  const active = jobsCurrent(db) ? processes.filter((p) => p.runs_30d > 0).length : 0;
+  const folders = new Set(processes.map((p) => p.folder)).size;
+  return {
+    kind, name, normalized: norm, processes, other_packages: others, linked, orchestrator,
+    unknowns: { dynamic_references: dynamic[0], packages_with_dynamic_references: dynamic[1], packages_not_fully_read: unreadable,
+      low_confidence_only: low, run_counts_current: jobsCurrent(db) },
+    risk: impactRisk(processes.length, active, folders, others.length, !!(dynamic[0] || unreadable || low)),
+  };
+}
+
+function impactMarkdown(r) {
+  const o = [`# Impact of changing ${r.kind} \`${r.name}\`\n`];
+  o.push(`**Risk: ${r.risk.level}**${r.risk.lower_bound ? " (lower bound: see What the index cannot rule out)" : ""}. ${r.risk.reason}.\n`);
+  if (r.orchestrator) {
+    o.push(`Orchestrator: ${r.orchestrator.found.length ? "exists as " + r.orchestrator.found.map(md).join(", ") : "not found"}` +
+      `${r.orchestrator.inventory_read ? "" : " (inventory not read: run crawl)"}.\n`);
+  }
+  if (r.processes.length) {
+    o.push("## Deployed processes\n\n| Process | Folder | Package | Via library | Mode | Refs | First reference | Runs (30d) | Enabled triggers | Confidence |\n|---|---|---|---|---|---|---|---|---|---|");
+    for (const p of r.processes) {
+      o.push("| " + [p.process, p.folder, `${p.package}@${p.version}`, p.via.join(", "), p.modes.join(", "), p.refs, p.first,
+        `${p.runs} (${p.runs_30d})`, p.enabled_triggers, p.confidence.join(", ")].map(md).join(" | ") + " |");
+    }
+    o.push("");
+  }
+  if (r.other_packages.length) {
+    o.push("## Other indexed packages (libraries, source folders, packages not deployed)\n\n| Package | Via library | Refs | First reference |\n|---|---|---|---|");
+    for (const p of r.other_packages) o.push("| " + [`${p.package}@${p.version}`, p.via.join(", "), p.refs, p.first].map(md).join(" | ") + " |");
+    o.push("");
+  }
+  if (r.linked.length) {
+    o.push("## One hop away (process links)\n\nNot referencing it directly, but connected to a process that does.\n\n| Process | Relation | Via | Resource |\n|---|---|---|---|");
+    for (const l of r.linked) o.push("| " + [l.process, l.relation, l.via, l.resource].map(md).join(" | ") + " |");
+    o.push("");
+  }
+  const u = r.unknowns;
+  o.push("## What the index cannot rule out\n");
+  o.push(`- ${u.dynamic_references} references of this kind are built at runtime, in ${u.packages_with_dynamic_references} packages: any of them could be this ${r.kind}.`);
+  o.push(`- ${u.packages_not_fully_read} packages were not fully read (compiled only, unsupported or failed).`);
+  if (u.low_confidence_only) o.push(`- ${u.low_confidence_only} of the packages above match only through low-confidence DLL strings.`);
+  if (!u.run_counts_current) o.push("- Run counts are not current (the last crawl did not read jobs), so activity is not part of the grade.");
+  return o.join("\n") + "\n";
+}
+
+/** Resources ranked by how many deployed processes depend on them: the shared parts where a change spreads. */
+function mostShared(db, top) {
+  const out = [];
+  const active = jobsCurrent(db);
+  const kindOf = {};
+  for (const [k, ks] of Object.entries(IMPACT_KINDS)) for (const e of ks || []) kindOf[e] = k;
+  const groups = new Map();
+  const add = (kind, name, key, folder, recent) => {
+    const k = kind + "\u0000" + String(name).toLowerCase(); // package ids ignore case
+    if (!groups.has(k)) groups.set(k, { kind, name, procs: new Set(), folders: new Set(), active: new Set() });
+    const g = groups.get(k);
+    g.procs.add(key);
+    g.folders.add(folder);
+    if (active && recent > 0) g.active.add(key);
+  };
+  const recent = new Map(db.rows("SELECT process_key, runs_30d FROM v_automation"));
+  for (const [kind, norm, key, folder] of db.rows(
+    `SELECT DISTINCT kind, normalized, process_key, folder_path FROM v_process_edge
+     WHERE normalized <> '${DYN}' AND normalized <> '' AND confidence <> 'low' AND kind IN (${Object.keys(kindOf).map((k) => `'${k}'`).join(",")})`)) {
+    add(kindOf[kind], norm, key, folder, recent.get(key));
+  }
+  for (const [dep, key, folder] of db.rows(
+    `SELECT DISTINCT COALESCE((SELECT k.package_id FROM package k WHERE lower(k.package_id) = lower(d.dep_name) LIMIT 1), d.dep_name), p.key, p.folder_path FROM process p JOIN dep_closure c ON c.root_id = p.package_id AND c.root_version = p.version
+     JOIN dependency d ON d.package_id = c.package_id AND d.version = c.version WHERE d.is_activity_pack = 0`)) {
+    add("library", dep, key, folder, recent.get(key));
+  }
+  for (const g of groups.values()) out.push({ kind: g.kind, name: g.name, processes: g.procs.size, folders: g.folders.size, active_30d: g.active.size });
+  out.sort((a, b) => (b.processes - a.processes) || (b.active_30d - a.active_30d) || cmpStr(a.kind, b.kind) || cmpStr(a.name, b.name));
+  return out.filter((g) => g.processes > 1).slice(0, top);
+}
+
+function mostSharedMarkdown(rows) {
+  if (!rows.length) return "No resource is shared by two or more deployed processes.\n";
+  const o = ["| Kind | Name | Processes | Folders | Active (30d) |", "|---|---|---|---|---|"];
+  for (const r of rows) o.push("| " + [r.kind, r.name, r.processes, r.folders, r.active_30d].map(md).join(" | ") + " |");
+  return o.join("\n") + "\n";
+}
+
+function cmdImpact(a) {
+  const db = connect(a.indexDir);
+  if (a.top !== null) {
+    if (a.kind || a.name) throw new Exit("use --top alone, or --kind with --name");
+    const rows = mostShared(db, a.top);
+    process.stdout.write(a.format === "json" ? JSON.stringify(rows, null, 2) + "\n" : `# Most shared resources\n\n${mostSharedMarkdown(rows)}`);
+    return;
+  }
+  if (!a.kind || !a.name) throw new Exit("impact needs --kind and --name (or --top N)");
+  const r = impactOf(db, a.kind, a.name);
+  process.stdout.write(a.format === "json" ? JSON.stringify(r, null, 2) + "\n" : impactMarkdown(r));
+}
+
+// ---------------------------------------------------------------------- diff
+
+/** NuGet (SemVer 2) order: numeric parts, a release after its prereleases, build metadata ignored. */
+function cmpVersion(a, b) {
+  const split = (v) => {
+    const core = String(v).split("+")[0];
+    const i = core.indexOf("-");
+    return i < 0 ? [core, null] : [core.slice(0, i), core.slice(i + 1)];
+  };
+  const parts = (s, numeric) => s.split(".").map((x) => (/^\d+$/.test(x) ? Number(x) : numeric ? 0 : x));
+  const cmpParts = (x, y, pad) => {
+    for (let i = 0; i < Math.max(x.length, y.length); i++) {
+      if (!pad && (x[i] === undefined || y[i] === undefined)) return x[i] === undefined ? -1 : 1;
+      const p = x[i] ?? 0, q = y[i] ?? 0;
+      const c = typeof p === "number" && typeof q === "number" ? p - q : typeof p === "number" ? -1 : typeof q === "number" ? 1 : cmpStr(p.toLowerCase(), q.toLowerCase());
+      if (c) return c;
+    }
+    return 0;
+  };
+  const [ra, pa] = split(a), [rb, pb] = split(b);
+  const c = cmpParts(parts(ra, false), parts(rb, false), true);
+  if (c) return c;
+  if (pa === null || pb === null) return pa === pb ? 0 : pa === null ? 1 : -1;
+  return cmpParts(parts(pa, false), parts(pb, false), false);
+}
+
+/** A fingerprint as named sets of facts, so two of them compare field by field. */
+function fingerprintFacts(fp) {
+  const m = new Map();
+  const set = (k, xs) => m.set(k, new Set((xs || []).map(String)));
+  for (const f of ["applications", "hosts", "assets", "credentials", "buckets", "invokes_processes", "connections", "databases",
+    "email_domains", "connector_operations", "entry_points"]) set(f, fp[f]);
+  set("queue_writes", fp.queues?.writes);
+  set("queue_reads", fp.queues?.reads);
+  set("libraries", (fp.libraries || []).map((l) => `${l.name} ${l.spec}`));
+  set("activity_packages", (fp.activity_packages || []).map((l) => `${l.name} ${l.spec}`));
+  set("upstream", (fp.upstream || []).map((l) => `${l.automation} (${l.via} ${l.resource})`));
+  set("downstream", (fp.downstream || []).map((l) => `${l.automation} (${l.via} ${l.resource})`));
+  set("documents", (fp.documents || []).filter((d) => !d.template).map((d) => d.path));
+  set("findings", (fp.findings || []).map((f) => `${f.rule} ${f.subject}`));
+  set("coverage", fp.coverage);
+  return m;
+}
+
+const DIFF_SCALARS = ["version", "has_sources", "target_framework", "studio_version", "expression_language", "workflows"];
+
+function diffFingerprints(a, b) {
+  const fa = fingerprintFacts(a), fb = fingerprintFacts(b);
+  const fields = [];
+  for (const [k, sb] of fb) {
+    const sa = fa.get(k) || new Set();
+    const added = [...sb].filter((x) => !sa.has(x)).sort(cmpStr);
+    const removed = [...sa].filter((x) => !sb.has(x)).sort(cmpStr);
+    if (added.length || removed.length) fields.push({ field: k, added, removed });
+  }
+  const scalars = [];
+  for (const k of DIFF_SCALARS) if (JSON.stringify(a[k] ?? null) !== JSON.stringify(b[k] ?? null)) scalars.push({ field: k, from: a[k] ?? null, to: b[k] ?? null });
+  for (const k of Object.keys({ ...a.complexity, ...b.complexity })) {
+    const x = a.complexity?.[k] ?? 0, y = b.complexity?.[k] ?? 0;
+    if (x !== y) scalars.push({ field: `complexity.${k}`, from: x, to: y });
+  }
+  return { package_id: b.package_id, from: a.version, to: b.version, scalars, fields };
+}
+
+/** The version that stands for a package on one side: a deployed one first, then the highest. */
+function representative(fps) {
+  return [...fps].sort((x, y) => ((y.processes || []).length > 0) - ((x.processes || []).length > 0) || cmpVersion(y.version, x.version))[0];
+}
+
+function readFingerprints(file) {
+  const out = [];
+  const text = fs.readFileSync(file, "utf8");
+  for (const [i, line] of text.split(/\r?\n/).entries()) {
+    if (!line.trim()) continue;
+    let o;
+    try {
+      o = JSON.parse(line);
+    } catch (e) {
+      throw new Exit(`${file}:${i + 1}: not JSON (${e.message})`);
+    }
+    if (!isObject(o) || !String(o.schema || "").startsWith("automation-index/fingerprint@")) throw new Exit(`${file}:${i + 1}: not an automation-index fingerprint (run export to make one)`);
+    out.push(o);
+  }
+  return out;
+}
+
+const GOVERNANCE_FIELDS = new Set(["applications", "hosts", "credentials", "connections", "databases", "email_domains", "connector_operations"]);
+
+function diffMarkdown(r) {
+  const o = [`# ${r.title}\n`, `- ${r.added.length} packages added, ${r.removed.length} removed, ${r.changed.length} changed, ${r.unchanged} unchanged\n`];
+  const reach = r.changed.flatMap((c) => c.fields.filter((f) => GOVERNANCE_FIELDS.has(f.field) && f.added.length).map((f) => [c.package_id, f]));
+  if (reach.length) {
+    o.push("## New external reach (applications, hosts, credentials, connections, databases, mail domains)\n\n| Package | Field | Added |\n|---|---|---|");
+    for (const [pkg, f] of reach) o.push("| " + [pkg, f.field, f.added.join(", ")].map(md).join(" | ") + " |");
+    o.push("");
+  }
+  if (r.added.length) o.push("## Added packages\n\n" + r.added.map((p) => `- ${p}`).join("\n") + "\n");
+  if (r.removed.length) o.push("## Removed packages\n\n" + r.removed.map((p) => `- ${p}`).join("\n") + "\n");
+  for (const c of r.changed) {
+    o.push(`## ${c.package_id} ${c.from} → ${c.to}\n`);
+    if (c.scalars.length) o.push(c.scalars.map((s) => `- ${s.field}: ${S(s.from)} → ${S(s.to)}`).join("\n") + "\n");
+    if (c.fields.length) {
+      o.push("| Field | Added | Removed |\n|---|---|---|");
+      for (const f of c.fields) o.push("| " + [f.field, f.added.join(", "), f.removed.join(", ")].map(md).join(" | ") + " |");
+      o.push("");
+    }
+  }
+  o.push("Facts are compared at the fingerprint level: values resolved statically, without low-confidence DLL strings. " +
+    "A fact that moved from one value to a runtime-built one shows as removed. Check each change with `impact` or the cards before acting on it.");
+  return o.join("\n") + "\n";
+}
+
+function cmdDiff(a) {
+  const db = connect(a.indexDir);
+  let before, after, title;
+  if (a.baseline) {
+    if (a.from || a.to) throw new Exit("use --baseline, or --package with --from and --to");
+    before = readFingerprints(a.baseline);
+    after = db.rows("SELECT package_id, version FROM package ORDER BY package_id, version").map(([p, v]) => fingerprint(db, p, v));
+    if (a.package) {
+      before = before.filter((f) => fnmatch(f.package_id, a.package));
+      after = after.filter((f) => fnmatch(f.package_id, a.package));
+    }
+    title = `Changes since ${path.basename(a.baseline)}`;
+  } else {
+    if (!a.package || !a.from || !a.to) throw new Exit("diff needs --baseline FILE, or --package ID --from V1 --to V2");
+    for (const v of [a.from, a.to]) if (!db.one("SELECT 1 FROM package WHERE package_id=? AND version=?", a.package, v)) throw new Exit(`${a.package}@${v} is not in the index`);
+    before = [fingerprint(db, a.package, a.from)];
+    after = [fingerprint(db, a.package, a.to)];
+    title = `${a.package} ${a.from} → ${a.to}`;
+  }
+  const group = (fps) => {
+    const m = new Map();
+    for (const f of fps) {
+      const k = String(f.package_id).toLowerCase();
+      if (!m.has(k)) m.set(k, []);
+      m.get(k).push(f);
+    }
+    return new Map([...m].map(([k, v]) => [k, representative(v)]));
+  };
+  const gb = group(before), ga = group(after);
+  const r = { title, added: [], removed: [], changed: [], unchanged: 0 };
+  for (const [k, f] of ga) {
+    if (!gb.has(k)) {
+      r.added.push(`${f.package_id}@${f.version}`);
+      continue;
+    }
+    const d = diffFingerprints(gb.get(k), f);
+    if (d.scalars.length || d.fields.length) r.changed.push(d);
+    else r.unchanged++;
+  }
+  for (const [k, f] of gb) if (!ga.has(k)) r.removed.push(`${f.package_id}@${f.version}`);
+  r.added.sort(cmpStr);
+  r.removed.sort(cmpStr);
+  r.changed.sort((x, y) => cmpStr(x.package_id, y.package_id));
+  process.stdout.write(a.format === "json" ? JSON.stringify(r, null, 2) + "\n" : diffMarkdown(r));
+}
+
+// ------------------------------------------------------------ standard formats
+
+const SARIF_LEVEL = { Critical: "error", Warning: "warning", Info: "note" };
+const SARIF_MAX_RESULTS = 25000;
+/** How to read each rule; the long form of the table in references/findings.md. */
+const RULE_HELP = {
+  "AI-COV-001": "Compiled-only, unsupported or failed package: facts for it are partial.",
+  "AI-SEC-001": "A literal password, token or key in source or Config. The value is redacted; move it to an Orchestrator credential asset.",
+  "AI-RES-001": "No asset with this name in any folder the crawl could see, or not in the folder the activity names.",
+  "AI-RES-002": "The asset exists, but not in the process's folder. A runtime failure, or shared through another folder.",
+  "AI-RES-003": "No queue with this name in any folder the crawl could see.",
+  "AI-RES-004": "No indexed package references this asset. With coverage gaps or dynamic reads, unused is not proven.",
+  "AI-RUN-001": "No runs in the job window: an orphan candidate.",
+  "AI-RUN-002": "More than 20% of at least 5 runs faulted.",
+  "AI-LIB-001": "Deployed processes pin different versions of the same library.",
+  "AI-LIB-002": "Deployed processes use more than two versions of an activity package.",
+  "AI-SRC-001": "No entry point reaches this workflow through static invokes, and no dynamic invoke could.",
+  "AI-SRC-002": "The target is built at runtime, so the index cannot name it.",
+  "AI-SRC-003": "The file is not well-formed XML.",
+  "AI-WA-001": "Workflow Analyzer errors on exactly the package that is deployed.",
+  "AI-WA-002": "Workflow Analyzer could not run, usually a Windows project on another platform.",
+  "AI-DOC-001": "No PDD, SDD, README or agent context file in the package. Documentation may live elsewhere.",
+  "AI-LNK-001": "Written by an automation, read by none of the indexed ones: a broken handover, or read outside UiPath.",
+  "AI-LNK-002": "Read by an automation, written by none of the indexed ones: fed from outside UiPath or by an automation not indexed.",
+  "AI-GOV-001": "The application or URL is outside the supplied restriction list. A static approximation of Automation Ops rules.",
+};
+const SECURITY_SEVERITY = { "AI-SEC-001": "9.0", "AI-GOV-001": "7.0" };
+
+/** "Main.xaml:41 [Assign]" -> { file, line, activity }; "Get.xaml:9 (in Lib@1.0.0)" also names the package
+ * the file belongs to. Evidence that is not a file reference returns null. */
+function evidenceLocation(ev) {
+  let e = String(ev || "").trim(), pkg = null, ver = null;
+  const lib = /^(.*?)\s+\(in (.+)@([^@()]+)\)$/.exec(e);
+  if (lib) [, e, pkg, ver] = lib;
+  const m = /^([^\s\[][^\[]*?\.(?:xaml|cs|json|xlsx|vb|ps1|py|js|md|txt|config))(?::(\d+))?(?:\s+\[(.*)\])?$/i.exec(e);
+  return m ? { file: m[1], line: m[2] ? parseInt(m[2], 10) : null, activity: m[3] ?? "", pkg, ver } : null;
+}
+
+/** Where a package's files are on disk: the project folder it was read from, else its copy in the index. */
+function packageRoot(db, indexDir, pkg, ver) {
+  const row = db.one("SELECT origin, file_path FROM package WHERE package_id=? AND version=?", pkg, ver);
+  if (!row) return null;
+  if (row[0] === "source" && row[1]) return path.resolve(row[1]);
+  return path.resolve(indexDir, "src", srcDirName(pkg, ver));
+}
+
+/** The file at `rel` under `root`, only when its real path (links resolved) stays under the root's real path. */
+function insideFile(root, rel) {
+  try {
+    const realRoot = fs.realpathSync(root);
+    const full = fs.realpathSync(path.resolve(root, ...rel.split("/")));
+    if (!full.startsWith(realRoot + path.sep)) return null;
+    return fs.statSync(full).isFile() ? full : null;
+  } catch {
+    return null;
+  }
+}
+
+function sarifLog(db, indexDir) {
+  const rules = RULES.map(([id, sev, title]) => ({
+    id, name: id.replace(/-/g, ""), shortDescription: { text: title }, fullDescription: { text: `${title}. ${RULE_HELP[id] || ""}`.trim() },
+    help: { text: RULE_HELP[id] || title, markdown: `${RULE_HELP[id] || title}\n\nSee references/findings.md in the automation-index skill.` },
+    defaultConfiguration: { level: SARIF_LEVEL[sev] },
+    properties: { tags: SECURITY_SEVERITY[id] ? ["automation-index", "security"] : ["automation-index"], ...(SECURITY_SEVERITY[id] ? { "security-severity": SECURITY_SEVERITY[id] } : {}) },
+  }));
+  const ruleIndex = new Map(rules.map((r, i) => [r.id, i]));
+  const total = db.one("SELECT count(*) FROM finding")[0];
+  const rows = db.objects(`SELECT rule, severity, package_id, version, process_key, subject, detail, evidence FROM finding
+    ORDER BY CASE severity WHEN 'Critical' THEN 0 WHEN 'Warning' THEN 1 ELSE 2 END, rule, package_id, version, subject, evidence, detail LIMIT ${SARIF_MAX_RESULTS}`);
+  const roots = new Map();
+  const rootOf = (pkg, ver) => {
+    const k = pkg + "\u0000" + ver;
+    if (!roots.has(k)) roots.set(k, packageRoot(db, indexDir, pkg, ver));
+    return roots.get(k);
+  };
+  const seen = new Map(); // fingerprint key -> occurrences so far, so identical findings stay separate alerts
+  const results = rows.map((f) => {
+    const root = f.package_id ? rootOf(f.package_id, f.version) : null;
+    const loc = evidenceLocation(f.evidence);
+    const fileRoot = loc && loc.pkg ? rootOf(loc.pkg, loc.ver) : root;
+    let full = fileRoot && loc ? insideFile(fileRoot, loc.file) : null;
+    const line = full ? loc.line || 1 : 1;
+    if (!full && root) full = insideFile(root, "project.json"); // a package-level finding points at the manifest
+    const key = [f.rule, f.package_id || "", f.subject || "", loc ? loc.file : "", loc ? loc.activity : "", loc && loc.pkg ? loc.pkg : ""].join("\u0000");
+    const n = (seen.get(key) || 0) + 1;
+    seen.set(key, n);
+    const result = {
+      ruleId: f.rule, ruleIndex: ruleIndex.get(f.rule), level: SARIF_LEVEL[f.severity] || "note",
+      message: { text: cut([f.subject, f.detail].filter((x) => x !== null && x !== undefined && x !== "").join(": ") || f.rule, 1000) },
+      partialFingerprints: { "automationIndexFinding/v1": sha256(key + "\u0000" + n) },
+      properties: { severity: f.severity, package: f.package_id ? `${f.package_id}@${f.version}` : null, process_keys: f.process_key, evidence: f.evidence },
+    };
+    if (full) result.locations = [{ physicalLocation: { artifactLocation: { uri: pathToFileURL(full).href }, region: { startLine: line } } }];
+    if (f.package_id) (result.locations ||= [{}])[0].logicalLocations = [{ fullyQualifiedName: `${f.package_id}@${f.version}`, kind: "module" }];
+    return result;
+  });
+  return {
+    $schema: "https://json.schemastore.org/sarif-2.1.0.json", version: "2.1.0",
+    runs: [{
+      tool: { driver: { name: "automation-index", version: `${EXTRACTOR_VERSION}.${SCHEMA_VERSION}`, rules } },
+      invocations: [{ executionSuccessful: true, workingDirectory: { uri: pathToFileURL(process.cwd() + path.sep).href } }],
+      results,
+      properties: { findings_total: total, truncated: total > rows.length, computed_at: db.one("SELECT max(computed_at) FROM finding")[0] },
+    }],
+  };
+}
+
+const purl = (name, ver) => `pkg:nuget/${encodeURIComponent(name)}@${encodeURIComponent(ver)}`;
+
+/** CycloneDX 1.6: indexed packages and their libraries and activity packages as components, the external
+ * hosts they reach as services, and the dependency graph between them. */
+function cyclonedx(db) {
+  const comps = new Map(), services = new Map(), deps = new Map();
+  const refOf = (pkg, ver, origin) => (origin === "source" ? `source:${pkg}@${ver}` : purl(pkg, ver));
+  // NuGet ids and versions ignore case: a reference to shared.lib 1.0.0 is the indexed Shared.Lib 1.0.0
+  const indexed = new Map(db.rows("SELECT package_id, version, origin FROM package").map(([p, v, o]) => [`${p}@${v}`.toLowerCase(), refOf(p, v, o)]));
+  const prop = (name, value) => ({ name: `automation-index:${name}`, value: String(value) });
+  for (const k of db.objects("SELECT package_id, version, kind, origin, sha256, layout, has_sources, description, output_type FROM package ORDER BY package_id, version")) {
+    const ref = refOf(k.package_id, k.version, k.origin);
+    const procs = db.rows("SELECT name, folder_path FROM process WHERE package_id=? AND version=? ORDER BY folder_path, name", k.package_id, k.version);
+    const cov = db.rows("SELECT status FROM coverage WHERE package_id=? AND version=? AND stage='extract'", k.package_id, k.version).map((r) => r[0]);
+    comps.set(ref, {
+      type: k.kind === "library" || k.output_type === "Library" ? "library" : "application", "bom-ref": ref, name: k.package_id, version: k.version,
+      ...(k.description ? { description: k.description } : {}),
+      ...(k.origin !== "source" ? { purl: purl(k.package_id, k.version), hashes: k.sha256 ? [{ alg: "SHA-256", content: k.sha256 }] : undefined } : {}),
+      properties: [prop("kind", k.kind), prop("origin", k.origin), prop("layout", k.layout), prop("has_sources", !!k.has_sources),
+        ...cov.map((c) => prop("coverage", c)), ...procs.map(([n, f]) => prop("process", `${f || ""}/${n}`))],
+    });
+    const on = new Set();
+    for (const [dn, spec, dv, ap] of db.rows("SELECT dep_name, dep_spec, dep_version, is_activity_pack FROM dependency WHERE package_id=? AND version=? ORDER BY dep_name", k.package_id, k.version)) {
+      const dref = dv ? indexed.get(`${dn}@${dv}`.toLowerCase()) || purl(dn, dv) : `nuget-range:${dn}@${spec}`;
+      if (!comps.has(dref)) {
+        comps.set(dref, { type: "library", "bom-ref": dref, name: dn, ...(dv ? { version: dv, purl: dref } : {}),
+          properties: [prop("kind", ap ? "activity_package" : "library"), ...(dv ? [] : [prop("version_range", spec)])] });
+      }
+      on.add(dref);
+    }
+    for (const [host, kinds] of db.rows(`SELECT normalized, group_concat(DISTINCT kind) FROM edge WHERE package_id=? AND version=? AND kind IN ('targets_url','calls_api')
+        AND normalized NOT IN ('${DYN}', '') AND confidence <> 'low' GROUP BY normalized ORDER BY normalized`, k.package_id, k.version)) {
+      const sref = `host:${host}`;
+      if (!services.has(sref)) services.set(sref, { "bom-ref": sref, name: host, properties: [prop("edge_kinds", kinds)] });
+      on.add(sref);
+    }
+    deps.set(ref, on);
+  }
+  // Only indexed packages get a dependency entry: a library or activity package that was never opened has an
+  // unknown graph, which CycloneDX expresses by leaving it out (an empty entry would claim it has none).
+  for (const c of comps.values()) if (c.hashes === undefined) delete c.hashes;
+  const unknown = [...comps.keys()].filter((r) => !deps.has(r));
+  const incomplete = db.rows("SELECT DISTINCT package_id, version FROM coverage WHERE stage='extract' AND status NOT IN ('indexed','ok')")
+    .map(([p, v]) => [...comps.values()].find((c) => c.name === p && c.version === v)?.["bom-ref"]).filter(Boolean);
+  return {
+    $schema: "http://cyclonedx.org/schema/bom-1.6.schema.json", bomFormat: "CycloneDX", specVersion: "1.6",
+    serialNumber: `urn:uuid:${crypto.randomUUID()}`, version: 1,
+    metadata: { timestamp: now(), tools: { components: [{ type: "application", name: "automation-index", version: `${EXTRACTOR_VERSION}.${SCHEMA_VERSION}` }] } },
+    components: [...comps.values()], services: [...services.values()],
+    dependencies: [...deps].map(([ref, on]) => ({ ref, dependsOn: [...on].sort(cmpStr) })),
+    ...(incomplete.length || unknown.length ? { compositions: [
+      ...(incomplete.length ? [{ aggregate: "incomplete", dependencies: incomplete }] : []),
+      ...(unknown.length ? [{ aggregate: "unknown", dependencies: unknown }] : [])] } : {}),
+  };
 }
 
 // ---------------------------------------------------------------------------- CLI
@@ -3546,9 +4091,23 @@ const COMMANDS = {
       review: { type: "string", help: "the claim-by-claim review; required (see references/summary-review.md)" } },
   },
   export: {
-    help: "write one JSON fingerprint per package (JSON Lines), for other tools",
+    help: "fingerprints (JSON Lines), findings (SARIF 2.1.0) or an SBOM (CycloneDX 1.6), for other tools",
     fn: cmdExport,
-    options: { out: { type: "string", help: "file to write (default: stdout)" }, package: { type: "string", help: "glob on package id" } },
+    options: { format: { type: "string", default: "jsonl", choices: ["jsonl", "sarif", "cyclonedx"] },
+      out: { type: "string", help: "file to write (default: stdout)" }, package: { type: "string", help: "glob on package id (jsonl only)" } },
+  },
+  impact: {
+    help: "who depends on an asset, queue, app, host, library...: processes, folders, runs, risk",
+    fn: cmdImpact,
+    options: { kind: { type: "string", choices: Object.keys(IMPACT_KINDS) }, name: { type: "string", help: "name, URL or glob" },
+      top: { type: "string", int: true, help: "rank the N resources shared by the most deployed processes" },
+      format: { type: "string", default: "md", choices: ["md", "json"] } },
+  },
+  diff: {
+    help: "what changed between two versions of a package, or since an earlier export",
+    fn: cmdDiff,
+    options: { baseline: { type: "string", help: "fingerprints from an earlier export" }, package: { type: "string", help: "package id (glob with --baseline)" },
+      from: { type: "string" }, to: { type: "string" }, format: { type: "string", default: "md", choices: ["md", "json"] } },
   },
 };
 
@@ -3626,7 +4185,7 @@ function parseCli(argv) {
   return out;
 }
 
-export { parseXml, iterNodes, scrub, dbTarget, resolveVersion, normHost, normApp, parseSelector, classifyAttr, Zip, readXlsx, fnmatch, normpath, unquote, safeRel };
+export { parseXml, iterNodes, scrub, dbTarget, resolveVersion, normHost, normApp, parseSelector, classifyAttr, Zip, readXlsx, fnmatch, normpath, unquote, safeRel, cmpVersion };
 
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href;
 if (isMain) try {

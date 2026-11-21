@@ -31,7 +31,7 @@ These are the only `uip` commands in `scripts/automation-index.mjs`. All of them
 A skill is guidance, and an agent can step outside it. Enforce read-only outside the skill:
 
 1. **Credentials.** Crawl with an Orchestrator external application or account that has view permissions only (folders, processes, packages, assets, queues, buckets, triggers, machines, jobs). With no write permission, a mutating command fails at the server whatever the agent does.
-2. **No credentials for question-answering.** Run `crawl` on a schedule from a service account. Give analysts and agents only `INDEX_DIR`. `extract`, `review`, `cards`, `query` and `status` need no login.
+2. **No credentials for question-answering.** Run `crawl` on a schedule from a service account. Give analysts and agents only `INDEX_DIR`. `extract`, `review`, `cards`, `query`, `status`, `impact`, `diff` and `export` need no login.
 3. **Agent permission settings.** Most coding agents can deny shell commands by pattern. Deny the commands listed above and allow `node .../automation-index.mjs` and read-only `uip or ... list|get` commands.
 4. **The `query` command** accepts exactly one `SELECT`, `WITH`, `VALUES` or `EXPLAIN` statement, or a `PRAGMA` from a read-only list (`table_info`, `table_list`, `index_list` and similar). It opens the database read-only, with `PRAGMA query_only` and in-memory temporary storage. `VACUUM INTO`, `ATTACH`, checkpoints, multiple statements and writes are refused.
 

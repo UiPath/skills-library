@@ -1,6 +1,6 @@
 ---
 name: automation-index
-description: "Builds and queries a read-only, evidence-backed index of every UiPath automation deployed in an Orchestrator tenant, or in a folder of .nupkg packages or project sources. Records which applications, URLs, APIs, assets, credentials, queues, buckets, databases, libraries and robot accounts each automation uses, with file and line, and reviews them for hard-coded secrets, missing or unused assets, processes that never run, library drift, Workflow Analyzer violations and apps or URLs outside an allow list. Use when asked what applications, URLs or robot accounts our robots use, which processes read an asset or queue, what breaks if an application, website, login page or library changes, to inventory, audit or document many automations at once, or to check what is deployed against governance rules. Never builds, packs, publishes, runs or changes anything. For one project's code quality use uipath-review; to change an automation use uipath-rpa; for Orchestrator operations use uipath-platform."
+description: "Builds and queries a read-only, evidence-backed index of the UiPath automations deployed in an Orchestrator tenant, or in .nupkg packages or project sources. Records which applications, URLs, APIs, assets, credentials, queues, buckets, databases, libraries and robot accounts each automation uses, with file and line, and reviews them for hard-coded secrets, missing or unused assets, processes that never run, library drift, Workflow Analyzer violations and apps or URLs outside an allow list. Use when asked what applications, URLs or robot accounts our robots use, which processes read an asset or queue, what breaks if an application, website, login page or library changes, what changed between releases, to inventory, audit or document many automations at once, or to check what is deployed against governance rules. Never builds, packs, publishes, runs or changes anything. For one project's code quality use uipath-review; to change an automation use uipath-rpa; for Orchestrator operations use uipath-platform."
 compatibility: "Node.js 22.5 or later, the same Node the uip CLI needs; no npm install. The crawl and analyze steps also need the uip CLI and a logged-in, ideally read-only, Orchestrator session."
 license: MIT
 ---
@@ -93,14 +93,24 @@ node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR cards
 
 Work in this order:
 
-1. **Query.** Open [references/schema.md](references/schema.md) for tables, views and example SQL. Start from `v_process_edge`, which includes edges inherited from libraries.
+1. **Use the built-in answers.** For "what breaks if X changes", run `impact`; for "what changed", run `diff`; for "where would a change spread furthest", run `impact --top`. Each output already carries evidence, run counts and what the index cannot rule out.
+
+   ```bash
+   node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR impact --kind asset --name Portal_Credential
+   node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR impact --kind host --name https://portal.example.com/login
+   node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR diff --package Invoices.Dispatcher --from 1.4.0 --to 1.5.0
+   ```
+
+   Kinds: `asset`, `credential`, `queue`, `bucket`, `process`, `connection`, `application`, `host`, `database`, `connector-operation`, `library`. Names match the way the extractor normalizes them, and accept `*` and `?` globs. The risk grade (`none`, `low`, `medium`, `high`) is computed from the number of deployed processes, folders and recent runs. It is a lower bound whenever dynamic references or unread packages exist. Say so when you report it.
+
+2. **Query.** Open [references/schema.md](references/schema.md) for tables, views and example SQL. Start from `v_process_edge`, which includes edges inherited from libraries.
 
    ```bash
    node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR query "SELECT ..." --format table
    ```
 
-2. **Read the source.** If the database lacks the fact, search the package's source tree (`INDEX_DIR/src/PACKAGE@VERSION_HASH/`; the card's Provenance section gives the exact folder) and cite `file:line`. Cards (`INDEX_DIR/cards/`) are a quick way to understand a single automation.
-3. **Propose an extractor.** If the same question will come back, say which activity and property an extractor should read. Do not change the script during an answer.
+3. **Read the source.** If the database lacks the fact, search the package's source tree (`INDEX_DIR/src/PACKAGE@VERSION_HASH/`; the card's Provenance section gives the exact folder) and cite `file:line`. Cards (`INDEX_DIR/cards/`) are a quick way to understand a single automation.
+4. **Propose an extractor.** If the same question will come back, say which activity and property an extractor should read. Do not change the script during an answer.
 
 Shape of an answer: the result, the SQL that produced it, evidence for the top rows, and a coverage line, for example "312 of 340 automations read from source; 25 compiled-only; 3 not downloaded; 41 URLs built at runtime".
 
@@ -119,10 +129,18 @@ Cards show the summary under "AI summary (non-authoritative)" with the number of
 ### Step 9 (optional): Hand the index to another tool
 
 ```bash
-node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR export --out fingerprints.jsonl
+node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR export --out fingerprints-DATE.jsonl
+node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR export --format sarif --out findings.sarif
+node SKILL_DIR/scripts/automation-index.mjs --index-dir INDEX_DIR export --format cyclonedx --out automations.cdx.json
 ```
 
-This writes one JSON fingerprint per package (schema `automation-index/fingerprint@1`). Each fingerprint carries identity, framework, activity counts, complexity signals (decisions, try/catch, retries, loops, human tasks), applications, hosts, assets, queues written and read, processes called, libraries, upstream and downstream automations, findings, and the reviewed summary marked non-authoritative. Other tools can read it instead of parsing the packages again.
+| Format | Contains | Read by |
+|---|---|---|
+| `jsonl` (default) | One fingerprint per package (schema `automation-index/fingerprint@1`): identity, framework, activity counts, complexity signals, applications, hosts, assets, queues written and read, processes called, libraries, upstream and downstream automations, findings, and the reviewed summary marked non-authoritative | Other tools, and `diff --baseline` later |
+| `sarif` | The `review` findings as SARIF 2.1.0, with rule help, severity, a stable fingerprint per finding and the file and line when the evidence names one | Code scanning dashboards (GitHub, Azure DevOps), SARIF viewers |
+| `cyclonedx` | A CycloneDX 1.6 bill of materials: packages, libraries and activity packages as components, external hosts as services, and the dependency graph between them | SBOM and dependency tools |
+
+Keep a dated `jsonl` export after each crawl. `diff --baseline fingerprints-DATE.jsonl` then shows what changed since that day, across the whole index. Details and limits: [references/formats.md](references/formats.md).
 
 ## Examples
 
@@ -133,8 +151,8 @@ Result: two ranked tables plus a coverage line. Low-confidence rows from compile
 
 **Example 2: change impact**
 User says: "The supplier portal login page changes next week. Which automations break?"
-Actions: find the portal's host and executable in `edge`; query `v_process_edge` for those normalized values, including `via` for library paths; follow `v_process_link` downstream to the automations they feed through queues or process calls; add `job_summary` to show which ones actually run.
-Result: affected automations with folder, file, line and activity of every selector, URL or library involved, plus the automations downstream of them, sorted by run volume.
+Actions: `impact --kind host --name PORTAL_URL`, and `impact --kind application` for its executable if it is a desktop app. When the output names a library under "Via library", the change reaches every process that pins it. Check the "cannot rule out" section, and query `edge` for the dynamic URLs it counts if the number is not zero.
+Result: affected automations with folder, first file and line, run counts and enabled triggers, sorted by recent runs. Then the automations one hop downstream through queues or process calls, the risk grade, and what the index could not see.
 
 **Example 3: robot accounts**
 User says: "How many robot accounts does the Invoice Dispatcher use?"
@@ -146,7 +164,12 @@ User says: "Does this automation still do what its PDD says?"
 Actions: list its documents (`document` table, kind `pdd`), read the PDD's Applications Used and exception sections, and compare them with `uses_application`, `targets_url` and the workflow facts.
 Result: what the PDD names that the code does not use, and what the code uses that the PDD does not mention, each with evidence. The index facts stay as they are; differences are reported, not resolved.
 
-**Example 5: governance check**
+**Example 5: what changed in a release**
+User says: "Invoices.Dispatcher 1.5.0 is going to production. What is different from 1.4.0?"
+Actions: index both packages (`extract --nupkg`), then `diff --package Invoices.Dispatcher --from 1.4.0 --to 1.5.0`. Read "New external reach" first, then check each change in the source tree.
+Result: applications, hosts, credentials, queues, libraries and findings added or removed, with new external reach listed first.
+
+**Example 6: governance check**
 User says: "Did anything reach production without passing our analyzer rules or using unapproved apps?"
 Actions: `analyze` with the policy, `review --restrictions FILE`, then report AI-WA-001, AI-WA-002 and AI-GOV-001.
 Result: violations with evidence, plus the packages that could not be analyzed and why.
