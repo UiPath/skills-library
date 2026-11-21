@@ -1,0 +1,11 @@
+{
+  "$schema": "../../schemas/recipe.schema.json",
+  "name": "automation-index",
+  "kind": "skill",
+  "authors": [
+    { "github": "roalexandru", "name": "Alexandru Roman", "organization": "UiPath" }
+  ],
+  "products": ["Orchestrator", "Studio", "Automation Ops"],
+  "tier": "community",
+  "cli_version": "1.206.0"
+}
