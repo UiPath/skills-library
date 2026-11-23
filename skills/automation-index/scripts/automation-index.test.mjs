@@ -1201,7 +1201,8 @@ const args = process.argv.slice(2); const a = args.join(" ");
 fs.appendFileSync(${JSON.stringify(log)}, a + "\\n");
 const ok = (Data) => console.log(JSON.stringify({ Result: "Success", Data, Pagination: { HasMore: false } }));
 if (a.startsWith("login status")) ok({ Status: "Logged in" });
-else if (a.startsWith("or processes list")) ok([{ Key: "k1", Name: "Proc", FolderKey: "f1", OrganizationUnitFullyQualifiedName: "Shared", ProcessKey: "P", ProcessVersion: "1" }]);
+else if (a.startsWith("or processes list")) ok([{ Key: "k1", Name: "Proc", FolderKey: "f1", OrganizationUnitFullyQualifiedName: "Shared", ProcessKey: "P", ProcessVersion: "1" },
+  { Key: "k2", Name: "Idle", FolderKey: "f1", OrganizationUnitFullyQualifiedName: "Shared", ProcessKey: "P2", ProcessVersion: "1" }]);
 else if (a.startsWith("or jobs list")) ok([{ Key: "j1", State: "Successful", StartTime: new Date().toISOString(), Release: { Key: "k1" }, LocalSystemAccount: "robot1" }]);
 else if (a.startsWith("or jobs get")) { if (!args.includes("--no-download")) fs.writeFileSync("job-output.bin", "PAYLOAD"); ok({ OrchestratorUserIdentity: "robot-account" }); }
 else ok([]);`);
@@ -1211,13 +1212,12 @@ else ok([]);`);
     assert.ok(fs.readFileSync(log, "utf8").split("\n").some((l) => l.startsWith("or jobs get j1") && l.includes("--no-download")));
     assert.ok(!fs.existsSync(path.join(d, "job-output.bin")));
     assert.equal(openDb(ix).prepare("SELECT orchestrator_identity FROM job_identity").get().orchestrator_identity, "robot-account");
-    // now a crawl that skips jobs: earlier run counts are stale, so no run findings
-    const w = openDb(ix);
-    w.prepare("INSERT INTO process VALUES ('K2','Idle','f1','Shared','P2','1','Process',NULL,NULL,1,0,NULL,'[]',NULL,NULL)").run();
-    w.close();
+    // the idle process comes from the crawl itself, so it survives the re-crawl below
     assert.equal(run(ix, "review").status, 0);
     assert.ok(openDb(ix).prepare("SELECT count(*) n FROM finding WHERE rule='AI-RUN-001'").get().n >= 1);
+    // now a crawl that skips jobs: earlier run counts are stale, so no run findings
     assert.equal(spawnSync(process.execPath, [SCRIPT, "--index-dir", ix, "crawl", "--uip", fake, "--skip-libraries", "--skip-jobs"], { encoding: "utf8", cwd: d }).status, 0);
+    assert.equal(openDb(ix).prepare("SELECT count(*) n FROM process WHERE name='Idle'").get().n, 1);
     assert.equal(run(ix, "review").status, 0);
     assert.equal(openDb(ix).prepare("SELECT count(*) n FROM finding WHERE rule LIKE 'AI-RUN-%'").get().n, 0);
   });
