@@ -1,5 +1,5 @@
 # Default owners: the library stewards, who approve or decline contributions.
-* @UiPath/skills-steward
+* @UiPath/skills-steward @RaduAna-Maria @gabrielavaduva
 
 # Per-skill owners are added below when a skill merges, one line per folder:
 # /skills/<name>/ @author-login @UiPath/skills-steward
